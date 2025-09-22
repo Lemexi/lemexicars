@@ -158,7 +158,7 @@ async function runApifyOnce() {
     urls: START_URLS,
     max_items_per_url: ITEMS_LIMIT,
     max_retries_per_url: 2,
-    proxy: { useApifyProxy: true },
+    proxy: { useApifyProxy: false },
   };
 
   const run = await apify.actor(APIFY_ACTOR).call(input);
