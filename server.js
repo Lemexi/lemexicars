@@ -16,8 +16,8 @@ const DATABASE_URL = process.env.DATABASE_URL;
 // фильтры
 const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
-const HOT_THRESHOLD     = Number(process.env.HOT_THRESHOLD || 0.85);
-const HOT_DISCOUNT_MIN  = Number(process.env.HOT_DISCOUNT_MIN || 0.20);
+const HOT_THRESHOLD     = Number(process.env.HOT_THRESHOLD || 0.85);  // <= 85% от средней — горячее
+const HOT_DISCOUNT_MIN  = Number(process.env.HOT_DISCOUNT_MIN || 0.20); // /top: скидка >= 20%
 const TOP_DAYS_DEFAULT  = Number(process.env.TOP_DAYS_DEFAULT || 7);
 const PAGES = Number(process.env.PAGES || 3);
 
@@ -34,7 +34,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-/* ===================== DB ===================== */
+/* ===================== DB (Neon/Postgres) ===================== */
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function initDb() {
@@ -140,11 +140,13 @@ let browser = null;
 async function launchBrowser() {
   if (browser) return browser;
 
-  // 1) берём путь из ENV (если ты захочешь зафиксировать версию вручную)
-  // 2) иначе — из встроенной функции Puppeteer (ищет в кэше Render)
+  // 1) пробуем путь из ENV (если прописан),
+  // 2) иначе берём путь из встроенной функции Puppeteer (ищет в /opt/render/.cache/puppeteer)
   const execPath =
     process.env.PUPPETEER_EXECUTABLE_PATH ||
     (await executablePath());
+
+  console.log('Puppeteer execPath:', execPath);
 
   browser = await puppeteer.launch({
     headless: 'new',
@@ -167,11 +169,8 @@ async function getHtml(url){
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
   await page.setExtraHTTPHeaders({ 'Accept-Language':'pl-PL,pl;q=0.9,en;q=0.8' });
   await page.setViewport({ width: 1366, height: 900 });
-
-  // экономим трафик
   await page.setRequestInterception(true);
   page.on('request', req => ['image','media','font'].includes(req.resourceType()) ? req.abort() : req.continue());
-
   await page.goto(url, { waitUntil:'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(700);
   const html = await page.content();
@@ -179,7 +178,7 @@ async function getHtml(url){
   return html;
 }
 
-/* ===================== Scrapers ===================== */
+/* ===================== Scrapers (regex по HTML) ===================== */
 async function parseHtml(html, site){
   const re = /<a[^>]*href="([^"]+)"[^>]*>(?:.*?)<\/a>.*?(?:<h2[^>]*>|<h3[^>]*>|<h6[^>]*|data-testid="ad-title")[^>]*>(.*?)<\/(?:h2|h3|h6|a)>.*?(?:data-testid="ad-price"[^>]*>|\bclass="[^"]*(?:ooa-1bmnxg7|css-13afqrm|css-1q7qk2x)[^"]*")[^>]*>(.*?)</gis;
   const items=[]; let m;
@@ -187,9 +186,7 @@ async function parseHtml(html, site){
     let url = m[1]; const title = norm(m[2].replace(/<[^>]+>/g,''));
     const price = priceN(m[3]);
     if (!url || !title || !price) continue;
-
-    if (!/^https?:\/\//i.test(url)) url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
-
+    if (!/^https?:\/\//!i.test(url)) url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
     const year = yearOf(title); const { make, model } = splitMM(title);
     items.push({
       id: (url.split('/').filter(Boolean).pop()||url).replace(/[^0-9a-z\-]/gi,''),
@@ -254,7 +251,7 @@ async function monitorOnce(){
 function startMonitor(mins=15){ if (timer) clearInterval(timer); timer=setInterval(monitorOnce, Math.max(1,mins)*60*1000); }
 function stopMonitor(){ if (timer) clearInterval(timer); timer=null; }
 
-/* ===================== /top ===================== */
+/* ===================== /top из базы ===================== */
 async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
   await initDb();
   const sql = `
@@ -291,11 +288,11 @@ async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
   return rows;
 }
 
-/* ===================== Routes ===================== */
+/* ===================== Routes + Webhook ===================== */
 app.get('/', (_req,res)=>res.send('lemexicars online 🚗'));
 app.get('/health', (_req,res)=>res.json({ ok:true }));
 
-// Диагностика браузера
+// диагностика браузера
 app.get('/chrome', async (_req, res) => {
   try {
     const b = await launchBrowser();
@@ -304,6 +301,16 @@ app.get('/chrome', async (_req, res) => {
   } catch (e) {
     res.json({ ok:false, error: e.message });
   }
+});
+
+// опционально: быстрый сет вебхука
+app.get('/set-webhook', async (_req, res) => {
+  if (!process.env.PUBLIC_URL) {
+    return res.json({ ok:false, error: 'Set PUBLIC_URL env to use /set-webhook' });
+  }
+  const url = `${process.env.PUBLIC_URL}/tg`;
+  const j = await tg('setWebhook', { url });
+  res.json({ ok:true, result: j });
 });
 
 app.post('/tg', async (req,res)=>{
@@ -320,9 +327,20 @@ app.post('/tg', async (req,res)=>{
     if (/^\/ping\b/i.test(text)) {
       await reply(chatId,'pong ✅');
 
+    } else if (/^\/help\b/i.test(text)) {
+      await reply(chatId,[
+        'Команды:',
+        '/ping — проверить связь',
+        '/watch [мин] — запустить мониторинг (по умолчанию 15)',
+        '/stop — остановить мониторинг',
+        '/status — статус и метрики',
+        '/scan — разовый обход источников',
+        `/top [N] [days] — топ скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%)`
+      ].join('\n'));
+
     } else if (/^\/watch\b/i.test(text)) {
       const m=text.match(/\/watch\s+(\d+)/i); const every=m?Number(m[1]):15;
-      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})`);
+      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})\nФильтры: Wrocław+100km, ${PRICE_MIN}–${PRICE_MAX} PLN.`);
       startMonitor(every); monitorOnce().catch(e=>console.error('first run',e));
 
     } else if (/^\/stop\b/i.test(text)) {
