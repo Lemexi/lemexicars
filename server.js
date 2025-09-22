@@ -1,5 +1,5 @@
 // server.js — OLX → Apify → Telegram
-// Node 18+, "type": "module"
+// Node 18+, package.json: { "type": "module" }
 
 import 'dotenv/config';
 import express from 'express';
@@ -68,7 +68,7 @@ async function tgSend(text, chatId = TELEGRAM_CHAT_ID, opts = {}) {
   return j;
 }
 
-/* Управление webhook через наш сервер (чтобы не ходить к api.telegram.org с телефона) */
+/* Управление webhook через наш сервер */
 async function tgSetWebhook(url) {
   const u = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook`;
   const r = await fetch(u, {
@@ -216,7 +216,7 @@ function findTopDeals(items, discount = TOP_DISCOUNT) {
   }
   const deals = [];
   for (const [key, g] of groups.entries()) {
-    if (g.count < 3) continue; // нужна хоть какая-то статистика
+    if (g.count < 3) continue; // небольшая защита от шумной «средней»
     const avg = g.sum / g.count;
     const threshold = avg * (1 - discount);
     for (const { it, price } of g.items) {
@@ -350,19 +350,26 @@ app.get('/tg/delete-webhook', async (req, res) => {
   try { res.json(await tgDeleteWebhook()); }
   catch (e) { res.status(500).json({ ok:false, error:e.message }); }
 });
+
+// ВАЖНО: форсим HTTPS и правильный путь /telegram/<SECRET>
 app.get('/tg/set-webhook', async (req, res) => {
   if (!checkAdminSecret(req, res)) return;
   try {
-    const hookUrl = `${req.protocol}://${req.get('host')}/telegram/${WEBHOOK_SECRET}`;
+    const host = req.get('host');
+    const hookUrl = `https://${host}/telegram/${WEBHOOK_SECRET}`;
     const j = await tgSetWebhook(hookUrl);
     res.json({ ...j, hookUrl });
-  } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
+
 app.get('/tg/webhook-info', async (req, res) => {
   if (!checkAdminSecret(req, res)) return;
   try { res.json(await tgGetWebhookInfo()); }
   catch (e) { res.status(500).json({ ok:false, error:e.message }); }
 });
+
 app.get('/tg/test', async (req, res) => {
   if (!checkAdminSecret(req, res)) return;
   try { res.json(await tgSend(req.query.text || 'Test from server', TELEGRAM_CHAT_ID)); }
@@ -370,7 +377,7 @@ app.get('/tg/test', async (req, res) => {
 });
 
 /* ================== START ================== */
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log('Server on http://localhost:' + PORT);
   console.log('Telegram webhook path: /telegram/' + WEBHOOK_SECRET);
 });
