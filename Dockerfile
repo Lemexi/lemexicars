@@ -1,6 +1,6 @@
 FROM node:20-bullseye
 
-# Библиотеки для запуска headless Chrome
+# Устанавливаем системные библиотеки для Chromium
 RUN apt-get update && \
     apt-get install -y \
       ca-certificates \
@@ -14,15 +14,14 @@ RUN apt-get update && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production
-# говорим Puppeteer не скипать загрузку
+# запрещаем скипать загрузку
 ENV PUPPETEER_SKIP_DOWNLOAD=false
-# куда ставить кеш
 ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
 
 WORKDIR /app
 COPY package*.json ./
 
-# Здесь Puppeteer скачает Chromium
+# На этом шаге Puppeteer скачает нужный Chrome
 RUN npm ci --omit=dev && npx puppeteer browsers install chrome
 
 COPY . .
