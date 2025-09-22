@@ -1,4 +1,4 @@
-// server.js — Lemexi Cars (Apify edition, без Puppeteer)
+// server.js — Lemexi Cars (OLX via Apify, no Puppeteer)
 import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
@@ -6,14 +6,16 @@ import fetch from 'node-fetch';
 import { Pool } from 'pg';
 
 /* ===================== ENV ===================== */
+// — Телеграм
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ALLOWED = (process.env.ALLOWED_CHAT_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || CHAT_ALLOWED[0];
 
+// — База (Neon)
 const DATABASE_URL = process.env.DATABASE_URL;
 
-// фильтры
+// — Фильтры
 const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
 
@@ -23,24 +25,19 @@ const HOT_THRESHOLD     = Number(process.env.HOT_THRESHOLD || 0.85);
 const HOT_DISCOUNT_MIN  = Number(process.env.HOT_DISCOUNT_MIN || 0.20);
 const TOP_DAYS_DEFAULT  = Number(process.env.TOP_DAYS_DEFAULT || 7);
 
-// сколько страниц эквивалентно будем просить у Actors (ограничим кол-во элементов)
-const MAX_ITEMS = Number(process.env.MAX_ITEMS || 100);
+// сколько страниц «виртуально» собирать (ограничение по кол-ву объявлений)
+const PAGES = Number(process.env.PAGES || 3);
 
-/* ===== Apify ===== */
-const APIFY_TOKEN      = process.env.APIFY_TOKEN;
-
-// ИД акторов из стора (можно переопределить через ENV)
-const OLX_ACTOR       = process.env.OLX_ACTOR       || 'ecomscrape/olx-product-search-scraper';
-const OTOMOTO_ACTOR   = process.env.OTOMOTO_ACTOR   || 'lexis-solutions/otomoto';
-
-// стартовые URL под наш фильтр (можно менять через ENV)
-const OLX_START_URL =
-  process.env.OLX_START_URL ||
+// OLX поиск (Wrocław +100 км, бюджет по умолчанию)
+const OLX_SEARCH_URL =
+  process.env.OLX_SEARCH_URL ||
   'https://www.olx.pl/d/motoryzacja/samochody/wroclaw/?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
 
-const OTOMOTO_START_URL =
-  process.env.OTOMOTO_START_URL ||
-  'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
+// === APIFY ===
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
+const APIFY_OLX_ACTOR =
+  process.env.APIFY_OLX_ACTOR ||
+  'ecomscrape/olx-product-search-scraper';
 
 /* ===================== APP ===================== */
 const app = express();
@@ -120,14 +117,15 @@ async function updateStats(ad) {
 
 /* ===================== Telegram helpers ===================== */
 async function tg(method, payload) {
+  if (!TOKEN) return { ok:false, error: 'No TELEGRAM_TOKEN' };
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const r = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
     body: JSON.stringify(payload)
   });
-  const j = await r.json();
-  if (!j.ok) console.error('TG API error:', j);
+  const j = await r.json().catch(()=>({ ok:false }));
+  if (!j?.ok) console.error('TG API error:', j);
   return j;
 }
 function isAllowed(chatId) { return CHAT_ALLOWED.includes(String(chatId)); }
@@ -139,117 +137,108 @@ function chunk(str, n=3500){ const a=[]; let s=String(str); while(s.length>n){le
 
 /* ===================== Utils ===================== */
 const norm   = s => String(s||'').replace(/\s+/g,' ').trim();
-const priceN = s => {
-  if (s == null) return null;
-  if (typeof s === 'number') return Number.isFinite(s) ? s : null;
-  const n=Number(String(s).replace(/[^\d]/g,''));
-  return Number.isFinite(n)?n:null;
-};
-const yearOf = t => { const m=String(t||'').match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
+const priceN = s => { const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; };
+const yearOf = t => { const m=String(t).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
 function splitMM(title=''){
   const p=norm(title).split(' ').filter(Boolean);
   return { make:(p[0]||'Unknown'), model:(p.slice(1,3).join(' ')||'UNKNOWN') };
 }
 
-/* ===================== Apify helpers ===================== */
+/* ===================== APIFY helpers (OLX) ===================== */
 /**
- * Бьём в актор через "run-sync-get-dataset-items" и сразу получаем JSON.
- * @param {string} actorSlug e.g. "ecomscrape/olx-product-search-scraper"
- * @param {object} input — см. описание актора
- * @returns {Promise<Array<Object>>} items
+ * Стартует актор Apify и возвращает массив items из dataset.
+ * Надёжный пуллинг статуса + чтение датасета.
  */
-async function apifyRunGetItems(actorSlug, input) {
-  const url = `https://api.apify.com/v2/acts/${actorSlug.replace('/','~')}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
-  const r = await fetch(url, {
+async function apifyRunGetItems(actorId, input, { pollMs=2000, maxWaitMs=90_000 } = {}) {
+  const startUrl = `https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/runs?token=${encodeURIComponent(APIFY_TOKEN)}`;
+  const r = await fetch(startUrl, {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify(input || {})
+    body: JSON.stringify(input||{})
   });
   if (!r.ok) {
-    const t = await r.text().catch(()=> '');
-    throw new Error(`Apify ${actorSlug} HTTP ${r.status} ${t?.slice(0,200)}`);
+    const text = await r.text().catch(()=>r.statusText);
+    throw new Error(`Apify ${actorId} HTTP ${r.status}: ${text}`);
   }
-  const items = await r.json();
+  const started = await r.json();
+  const runId = started?.data?.id;
+  const datasetId = started?.data?.defaultDatasetId;
+  if (!runId || !datasetId) throw new Error('Apify: runId/datasetId not received');
+
+  const runUrl = (id)=>`https://api.apify.com/v2/actor-runs/${id}?token=${encodeURIComponent(APIFY_TOKEN)}`;
+  const t0 = Date.now();
+  while (true) {
+    const rr = await fetch(runUrl(runId));
+    const j  = await rr.json().catch(()=>({}));
+    const status = j?.data?.status;
+    if (status === 'SUCCEEDED') break;
+    if (['FAILED','ABORTED','TIMED-OUT'].includes(status)) {
+      throw new Error(`Apify run failed: ${status}`);
+    }
+    if (Date.now()-t0 > maxWaitMs) throw new Error('Apify run timeout');
+    await new Promise(res=>setTimeout(res, pollMs));
+  }
+
+  const dsUrl = `https://api.apify.com/v2/datasets/${datasetId}/items?token=${encodeURIComponent(APIFY_TOKEN)}&clean=true`;
+  const ds = await fetch(dsUrl);
+  if (!ds.ok) throw new Error(`Apify dataset HTTP ${ds.status}`);
+  const items = await ds.json().catch(()=>[]);
   return Array.isArray(items) ? items : [];
 }
 
-/* ===== Маппинг OLX результата в нашу структуру =====
-   OLX Product Search Scraper (ecomscrape):
-   поля обычно: id / url / name / price / details[] (model/year/...)
-*/
-function mapOlx(items=[]) {
-  const out=[];
-  for (const it of items) {
-    const id = String(it.id || it.uuid || it.url || '').replace(/[^0-9a-z\-]/gi,'');
+/**
+ * Вызывает актор OLX и мапит выдачу в общий формат {id,title,make,model,year,price,url}
+ */
+async function parseOlxList() {
+  // Подготовим ограничение по количеству
+  const perPageGuess = 24; // обычно ~24 в выдаче
+  const limit = Math.max(1, Math.min(200, perPageGuess * PAGES));
+
+  // Апифай-актор принимает либо start urls, либо поисковые параметры.
+  const input = {
+    startUrls: [OLX_SEARCH_URL
+      .replace(/filter_float_price%3Afrom%5D=\d+/,'filter_float_price%3Afrom%5D='+PRICE_MIN)
+      .replace(/filter_float_price%3Ato%5D=\d+/,'filter_float_price%3Ato%5D='+PRICE_MAX)
+    ],
+    maxItems: limit
+  };
+
+  const raw = await apifyRunGetItems(APIFY_OLX_ACTOR, input);
+
+  // Пример структуры (снимки с твоего экрана): { id, url, name, price, details:[{key:'year'|'model'...}] }
+  const out = [];
+  for (const it of raw) {
+    if (!it) continue;
+    const id = String(it.id || (it.url||'').split('/').filter(Boolean).pop() || '').replace(/[^0-9a-z\-]/gi,'');
     const title = norm(it.name || it.title || '');
-    const price = priceN(it.price || it.price_number || it.priceValue || (it.price_text||''));
-    const url   = it.url || it.link || '';
+    const url = it.url || '';
+    // цена может быть строкой или объектом
+    const priceCandidate = it.price?.value ?? it.price ?? it.price_text ?? it.priceText;
+    const price = priceN(priceCandidate);
     if (!id || !title || !price || !url) continue;
 
-    let year = Number(it.year || it.production_year || null);
-    if (!year) year = yearOf(title);
-
-    // попробуем достать make/model из деталей
-    let make=null, model=null;
+    // детали
+    let year = null, make=null, model=null;
     if (Array.isArray(it.details)) {
       for (const d of it.details) {
-        const key = String(d.key||'').toLowerCase();
-        if (!make && (key==='make' || key==='brand')) make = d.value || d.normalized_value || null;
-        if (!model && key==='model') model = d.value || d.normalized_value || null;
-        if (!year && key==='year') year = Number(d.value || d.normalized_value);
+        const k = String(d?.key||'').toLowerCase();
+        if (!year && (k==='year'||k.includes('rok'))) year = Number(d?.value) || yearOf(title);
+        if (!model && k==='model') model = String(d?.value||'').trim();
+        if (!make  && k==='make')  make  = String(d?.value||'').trim();
       }
     }
     if (!make || !model) {
-      const mm = splitMM(title); make = make || mm.make; model = model || mm.model;
+      const mm = splitMM(title);
+      make  = make  || mm.make;
+      model = model || mm.model;
     }
-    out.push({ id, title, make, model, year, price, url });
-  }
-  return out;
-}
-
-/* ===== Маппинг OTOMOTO результата =====
-   Otomoto.pl Scraper (lexis-solutions/otomoto):
-   обычно: id / url / title / price / year / make / model
-*/
-function mapOtomoto(items=[]) {
-  const out=[];
-  for (const it of items) {
-    const id = String(it.id || it.ad_id || it.url || '').replace(/[^0-9a-z\-]/gi,'');
-    const title = norm(it.title || it.name || '');
-    const price = priceN(it.price || it.price_number || it.priceValue || (it.price_text||''));
-    const url   = it.url || it.link || '';
-    if (!id || !title || !price || !url) continue;
-
-    const make  = it.make || it.brand || splitMM(title).make;
-    const model = it.model || splitMM(title).model;
-    let year    = Number(it.year || it.production_year || null);
     if (!year) year = yearOf(title);
 
     out.push({ id, title, make, model, year, price, url });
   }
-  return out;
-}
 
-/* ===== Обёртки источников через Apify ===== */
-async function parseOlxList() {
-  const input = {
-    startUrls: [{ url: OLX_START_URL }],
-    maxItems: MAX_ITEMS
-  };
-  const items = await apifyRunGetItems(OLX_ACTOR, input);
-  return mapOlx(items)
-    .filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
-}
-
-async function parseOtomotoList() {
-  // у community-актора поля могут отличаться; стартового URL достаточно
-  const input = {
-    startUrls: [{ url: OTOMOTO_START_URL }],
-    maxItems: MAX_ITEMS
-  };
-  const items = await apifyRunGetItems(OTOMOTO_ACTOR, input);
-  return mapOtomoto(items)
-    .filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
+  // Фильтр по бюджету всё равно держим
+  return out.filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
 }
 
 /* ===================== Monitor loop ===================== */
@@ -259,7 +248,8 @@ let lastRunInfo = { ts:null, found:0, sent:0, notes:[] };
 async function monitorOnce(){
   await initDb();
   const notes=[]; let found=0, sent=0;
-  const sources=[ {name:'OLX', fn:parseOlxList}, {name:'OTOMOTO', fn:parseOtomotoList} ];
+
+  const sources=[ {name:'OLX', fn:parseOlxList} ];
 
   for (const s of sources){
     try{
@@ -286,7 +276,9 @@ async function monitorOnce(){
         await notify(text); sent++;
       }
     }catch(e){
-      notes.push(`${s.name} error: ${e.message}`); console.error(`${s.name} error`, e);
+      const msg = `${s.name} error: ${e.message}`;
+      notes.push(msg);
+      console.error(msg);
     }
   }
 
@@ -334,24 +326,20 @@ async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
 }
 
 /* ===================== Routes + Webhook ===================== */
-app.get('/', (_req,res)=>res.send('lemexicars online 🚗 (Apify)'));
+app.get('/', (_req,res)=>res.send('lemexicars online 🚗 (OLX via Apify)'));
 app.get('/health', (_req,res)=>res.json({ ok:true }));
 
-// Диагностика: смотреть, что отдаёт Apify прямо сейчас
-app.get('/olx-test', async (_req, res) => {
+// быстрая проверка Apify
+app.get('/apify', async (_req,res)=>{
   try {
-    const data = await parseOlxList();
-    res.json({ ok:true, count: data.length, sample: data.slice(0,5) });
-  } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-app.get('/otomoto-test', async (_req, res) => {
-  try {
-    const data = await parseOtomotoList();
-    res.json({ ok:true, count: data.length, sample: data.slice(0,5) });
-  } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
+    const items = await apifyRunGetItems(APIFY_OLX_ACTOR, { startUrls:[OLX_SEARCH_URL], maxItems: 5 }, { maxWaitMs: 60_000 });
+    res.json({ ok:true, got: items.length, sample: items.slice(0,2) });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e.message });
+  }
 });
 
-// опционально: быстрый сет вебхука
+// опционально: быстрый сет вебхука (если нужно переустановить)
 app.get('/set-webhook', async (_req, res) => {
   if (!process.env.PUBLIC_URL) {
     return res.json({ ok:false, error: 'Set PUBLIC_URL env to use /set-webhook' });
@@ -383,12 +371,14 @@ app.post('/tg', async (req,res)=>{
         '/stop — остановить мониторинг',
         '/status — статус и метрики',
         '/scan — разовый обход источников',
-        `/top [N] [days] — топ скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%)`
+        `/top [N] [days] — топ скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%)`,
+        '',
+        'Источник: OLX через Apify'
       ].join('\n'));
 
     } else if (/^\/watch\b/i.test(text)) {
       const m=text.match(/\/watch\s+(\d+)/i); const every=m?Number(m[1]):15;
-      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (источники: OLX+Otomoto, max ${MAX_ITEMS} элементов).`);
+      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})\nФильтры: Wrocław+100km, ${PRICE_MIN}–${PRICE_MAX} PLN.\nИсточник: OLX (Apify).`);
       startMonitor(every); monitorOnce().catch(e=>console.error('first run',e));
 
     } else if (/^\/stop\b/i.test(text)) {
@@ -406,11 +396,12 @@ app.post('/tg', async (req,res)=>{
         i.notes?.length ? `Заметки: ${i.notes.join(' | ')}` : '',
         `База: ads_seen=${seenCount[0]?.c||0}, model_stats=${statsCount[0]?.c||0}`,
         `Фильтр: ${PRICE_MIN}–${PRICE_MAX} PLN, hot=${Math.round(HOT_THRESHOLD*100)}%`,
-        `TOP: окно ${TOP_DAYS_DEFAULT} дн., мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%, maxItems=${MAX_ITEMS}`
+        `TOP: окно ${TOP_DAYS_DEFAULT} дн., мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%, страниц=${PAGES}`,
+        `Источник: OLX (Apify)`
       ].filter(Boolean).join('\n'));
 
     } else if (/^\/scan\b/i.test(text)) {
-      await reply(chatId, '🔎 Делаю разовый обход источников через Apify…');
+      await reply(chatId, '🔎 Делаю разовый обход OLX через Apify…');
       try {
         const info = await monitorOnce();
         await reply(chatId, `Готово. Найдено: ${info.found}, отправлено: ${info.sent}. Теперь можно смотреть /top.`);
@@ -457,4 +448,4 @@ app.post('/tg', async (req,res)=>{
 
 /* ===================== Start ===================== */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('lemexicars (Apify) up on', PORT));
+app.listen(PORT, () => console.log('lemexicars up on', PORT, 'OLX via Apify'));
