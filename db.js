@@ -29,12 +29,17 @@ const stmtIns = db.prepare(`
   INSERT OR IGNORE INTO seen_ads(ad_hash, url, title, price_num, published_at, sent_reason)
   VALUES (?, ?, ?, ?, ?, ?)
 `);
+const stmtCount = db.prepare('SELECT COUNT(1) AS c FROM seen_ads');
 
 export function hasSeen(hash) {
   return !!stmtHas.get(hash);
 }
 export function markSeen(hash, { url, title, price, publishedAt, reason }) {
   stmtIns.run(hash, url || null, title || null, price ?? null, publishedAt || null, reason || null);
+}
+export function countSeen() {
+  const row = stmtCount.get();
+  return Number(row?.c || 0);
 }
 export function closeDb() {
   db.close();
