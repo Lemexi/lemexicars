@@ -19,7 +19,7 @@ const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
 const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 0.85); // 85% от средней
 
 const TOP_DAYS_DEFAULT = Number(process.env.TOP_DAYS_DEFAULT || 7);
-const HOT_DISCOUNT_MIN = Number(process.env.HOT_DISCOUNT_MIN || 0.20);   // для /top
+const HOT_DISCOUNT_MIN = Number(process.env.HOT_DISCOUNT_MIN || 0.20); // для /top
 const PAGES = Number(process.env.PAGES || 3);
 
 const OLX_SEARCH_URL =
@@ -134,26 +134,30 @@ function yearFrom(title=''){ const m=String(title).match(/\b(19\d{2}|20\d{2})\b/
 function splitMM(title=''){ const p=norm(title).split(' ').filter(Boolean); return { make:p[0]||'Unknown', model:p.slice(1,3).join(' ')||'UNKNOWN' }; }
 function withPage(url,p){ return p<=1?url : url + (url.includes('?')?`&page=${p}`:`?page=${p}`); }
 
-/* ============== Puppeteer (Chrome path) ============== */
-const EXEC_PATH = (() => {
+/* ============== Puppeteer (обязательный executablePath) ============== */
+function resolveExecPath() {
   const env = process.env.PUPPETEER_EXECUTABLE_PATH;
   const candidates = [
     env,
-    '/usr/bin/google-chrome',         // puppeteer official image
+    '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser'
   ].filter(Boolean);
-  for (const p of candidates) { try { if (fs.existsSync(p)) return p; } catch {} }
-  return undefined; // пусть решит сам, но в нашем образе путь есть
-})();
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  // Последний шанс: всё равно вернём дефолт для puppeteer-core (иначе он падает с "must be specified")
+  return '/usr/bin/google-chrome';
+}
+const EXEC_PATH = resolveExecPath();
 
 let browser = null;
 async function getHtml(url){
   if (!browser) {
     browser = await puppeteer.launch({
       headless: 'new',
-      executablePath: EXEC_PATH,
+      executablePath: EXEC_PATH,                   // <- всегда указан
       args: ['--no-sandbox','--disable-dev-shm-usage','--single-process']
     });
   }
@@ -173,17 +177,13 @@ async function getHtml(url){
 
 /* ============== Parsers (regex по html) ============== */
 async function parseHtml(html, site){
-  // обобщённый выдёргиватель ссылок/титулов/цен для OLX+OTOMOTO
   const re = /<a[^>]*href="([^"]+)"[^>]*>(?:.*?)<\/a>.*?(?:<h2[^>]*>|<h3[^>]*>|<h6[^>]*|data-testid="ad-title")[^>]*>(.*?)<\/(?:h2|h3|h6|a)>.*?(?:data-testid="ad-price"[^>]*>|\bclass="[^"]*(?:ooa-1bmnxg7|css-13afqrm|css-1q7qk2x)[^"]*")[^>]*>(.*?)</gis;
   const items=[]; let m;
   while ((m = re.exec(html)) !== null) {
     let url = m[1]; const title = norm(m[2].replace(/<[^>]+>/g,''));
-    const price = priceNum(m[3]);
-    if (!url || !title || !price) continue;
+    const price = priceNum(m[3]); if (!url || !title || !price) continue;
+    if (!/^https?:\/\//i.test(url)) url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
 
-    if (!/^https?:\/\//i.test(url)) {
-      url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
-    }
     const year = yearFrom(title); const { make, model } = splitMM(title);
     items.push({
       id: (url.split('/').filter(Boolean).pop()||url).replace(/[^0-9a-z\-]/gi,''),
@@ -248,14 +248,14 @@ async function monitorOnce(){
 function startMonitor(mins=15){ if (timer) clearInterval(timer); timer=setInterval(monitorOnce, Math.max(1,mins)*60*1000); }
 function stopMonitor(){ if (timer) clearInterval(timer); timer=null; }
 
-/* ============== /top из базы за окно ============== */
+/* ============== /top (фикс $1::interval) ============== */
 async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
   await initDb();
   const sql = `
     WITH recent AS (
       SELECT site, ad_id, title, make, model, year, price::numeric AS price, url, seen_at
       FROM ads_seen
-      WHERE seen_at >= NOW() - INTERVAL $1
+      WHERE seen_at >= NOW() - $1::interval
         AND price BETWEEN $2 AND $3
     ),
     avg_mmy AS (
@@ -302,6 +302,7 @@ app.post('/tg', async (req,res)=>{
 
     if (/^\/ping\b/i.test(text)) {
       await reply(chatId,'pong ✅');
+
     } else if (/^\/help\b/i.test(text)) {
       await reply(chatId,[
         'Команды:',
@@ -309,14 +310,18 @@ app.post('/tg', async (req,res)=>{
         '/watch [мин] — запустить мониторинг (по умолчанию 15)',
         '/stop — остановить мониторинг',
         '/status — статус и метрики',
-        `/top [N] [days] — топ N скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%) за days дней`
+        `/top [N] [days] — топ N скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%) за days дней`,
+        '/scan — разовый обход источников'
       ].join('\n'));
+
     } else if (/^\/watch\b/i.test(text)) {
       const m=text.match(/\/watch\s+(\d+)/i); const every=m?Number(m[1]):15;
       await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})\nФильтры: Wrocław+100km, ${PRICE_MIN}–${PRICE_MAX} PLN.`);
       startMonitor(every); monitorOnce().catch(e=>console.error('first run',e));
+
     } else if (/^\/stop\b/i.test(text)) {
       stopMonitor(); await reply(chatId,'⏹ Мониторинг остановлен.');
+
     } else if (/^\/status\b/i.test(text)) {
       await initDb();
       const { rows: seenCount } = await pool.query('SELECT COUNT(*)::int AS c FROM ads_seen');
@@ -331,15 +336,36 @@ app.post('/tg', async (req,res)=>{
         `Фильтр: ${PRICE_MIN}–${PRICE_MAX} PLN, hot=${Math.round(HOT_THRESHOLD*100)}%`,
         `TOP: окно ${TOP_DAYS_DEFAULT} дн., мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%, страниц=${PAGES}`
       ].filter(Boolean).join('\n'));
+
+    } else if (/^\/scan\b/i.test(text)) {
+      await reply(chatId, '🔎 Делаю разовый обход источников…');
+      try {
+        const info = await monitorOnce();
+        await reply(chatId, `Готово. Найдено: ${info.found}, отправлено: ${info.sent}. Теперь можно смотреть /top.`);
+      } catch (e) {
+        await reply(chatId, `Ошибка сканирования: ${e.message}`);
+      }
+
     } else if (/^\/top\b/i.test(text)) {
       await initDb();
       const m=text.match(/\/top(?:\s+(\d+))?(?:\s+(\d+))?/i);
       const N=m&&m[1]?Math.max(1,Math.min(30,Number(m[1]))):10;
       const days=m&&m[2]?Math.max(1,Math.min(90,Number(m[2]))):TOP_DAYS_DEFAULT;
 
-      const rows=await queryTopDeals(N, days);
-      if (!rows.length) { await reply(chatId,`За последние ${days} дн. выгодных предложений (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%) не найдено.`); }
-      else {
+      // если за окно данных нет — сделаем разовый обход
+      const { rows: cntRows } = await pool.query(
+        'SELECT COUNT(*)::int AS c FROM ads_seen WHERE seen_at >= NOW() - $1::interval',
+        [`${days} days`]
+      );
+      if ((cntRows[0]?.c || 0) === 0) {
+        await reply(chatId, '🗃️ База пуста за выбранный период — делаю разовый обход...');
+        await monitorOnce().catch(e => console.error('scan for top', e));
+      }
+
+      const rows = await queryTopDeals(N, days);
+      if (!rows.length) {
+        await reply(chatId, `За последние ${days} дн. выгодных предложений (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%) не найдено.`);
+      } else {
         let out=`🔝 Топ-${rows.length} предложений за ${days} дн. (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%):\n`;
         rows.forEach((r,i)=>{
           const avg=Number(r.avg_price); const dPct=Math.round(Number(r.discount||0)*100);
