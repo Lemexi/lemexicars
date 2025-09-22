@@ -1,3 +1,4 @@
+// server.js — Lemexi Cars
 import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
@@ -35,8 +36,8 @@ const OTOMOTO_SEARCH_URL =
   process.env.OTOMOTO_SEARCH_URL ||
   'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
 
-// главный герой: путь до браузера, который задаёт Dockerfile
-const EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH;
+// путь до системного Chromium (задаёт Dockerfile); дадим дефолт
+const EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
 
 /* ===================== APP ===================== */
 const app = express();
@@ -137,21 +138,29 @@ function chunk(str, n=3500){ const a=[]; let s=String(str); while(s.length>n){le
 const norm   = s => String(s||'').replace(/\s+/g,' ').trim();
 const priceN = s => { const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; };
 const yearOf = t => { const m=String(t).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
-function splitMM(title=''){ const p=norm(title).split(' ').filter(Boolean); return { make:p[0]||'Unknown', model:p.slice(1,3).join(' ')||'UNKNOWN' }; }
+function splitMM(title=''){
+  const p=norm(title).split(' ').filter(Boolean);
+  return { make:(p[0]||'Unknown'), model:(p.slice(1,3).join(' ')||'UNKNOWN') };
+}
 const withPage = (url,p)=> p<=1?url : url+(url.includes('?')?`&page=${p}`:`?page=${p}`);
 
 /* ===================== Puppeteer-core ===================== */
 let browser = null;
 
 async function getHtml(url){
-  if (!EXECUTABLE_PATH) {
-    throw new Error('PUPPETEER_EXECUTABLE_PATH is not set');
-  }
+  // здесь больше не падаем при пустой переменной — есть дефолт из Dockerfile
+  const executablePath = EXECUTABLE_PATH || '/usr/bin/chromium';
+
   if (!browser) {
     browser = await puppeteer.launch({
       headless: 'new',
-      executablePath: EXECUTABLE_PATH,      // <-- из Dockerfile
-      args: ['--no-sandbox','--disable-dev-shm-usage','--single-process']
+      executablePath,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--single-process'
+      ]
     });
   }
   const page = await browser.newPage();
@@ -283,6 +292,16 @@ async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
 /* ===================== Routes + Webhook ===================== */
 app.get('/', (_req,res)=>res.send('lemexicars online 🚗'));
 app.get('/health', (_req,res)=>res.json({ ok:true }));
+
+// опционально: быстрый сет вебхука (если нужно переустановить)
+app.get('/set-webhook', async (_req, res) => {
+  if (!process.env.PUBLIC_URL) {
+    return res.json({ ok:false, error: 'Set PUBLIC_URL env to use /set-webhook' });
+  }
+  const url = `${process.env.PUBLIC_URL}/tg`;
+  const j = await tg('setWebhook', { url });
+  res.json({ ok:true, result: j });
+});
 
 app.post('/tg', async (req,res)=>{
   try{
