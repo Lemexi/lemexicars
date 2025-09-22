@@ -1,9 +1,8 @@
-// server.js — Lemexi Cars (Render Node service, Puppeteer + Postgres + Telegram)
+// server.js — Lemexi Cars (Apify edition, без Puppeteer)
 import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import fetch from 'node-fetch';
-import puppeteer, { executablePath } from 'puppeteer';
 import { Pool } from 'pg';
 
 /* ===================== ENV ===================== */
@@ -11,22 +10,36 @@ const TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ALLOWED = (process.env.ALLOWED_CHAT_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || CHAT_ALLOWED[0];
+
 const DATABASE_URL = process.env.DATABASE_URL;
 
 // фильтры
 const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
-const HOT_THRESHOLD     = Number(process.env.HOT_THRESHOLD || 0.85);  // <= 85% от средней — горячее
-const HOT_DISCOUNT_MIN  = Number(process.env.HOT_DISCOUNT_MIN || 0.20); // /top: скидка >= 20%
-const TOP_DAYS_DEFAULT  = Number(process.env.TOP_DAYS_DEFAULT || 7);
-const PAGES = Number(process.env.PAGES || 3);
 
-// поисковые URL
-const OLX_SEARCH_URL =
-  process.env.OLX_SEARCH_URL ||
+// «горячее предложение» — цена <= 85% от средней
+const HOT_THRESHOLD     = Number(process.env.HOT_THRESHOLD || 0.85);
+// для /top считаем «выгодными» скидки >= 20%
+const HOT_DISCOUNT_MIN  = Number(process.env.HOT_DISCOUNT_MIN || 0.20);
+const TOP_DAYS_DEFAULT  = Number(process.env.TOP_DAYS_DEFAULT || 7);
+
+// сколько страниц эквивалентно будем просить у Actors (ограничим кол-во элементов)
+const MAX_ITEMS = Number(process.env.MAX_ITEMS || 100);
+
+/* ===== Apify ===== */
+const APIFY_TOKEN      = process.env.APIFY_TOKEN;
+
+// ИД акторов из стора (можно переопределить через ENV)
+const OLX_ACTOR       = process.env.OLX_ACTOR       || 'ecomscrape/olx-product-search-scraper';
+const OTOMOTO_ACTOR   = process.env.OTOMOTO_ACTOR   || 'lexis-solutions/otomoto';
+
+// стартовые URL под наш фильтр (можно менять через ENV)
+const OLX_START_URL =
+  process.env.OLX_START_URL ||
   'https://www.olx.pl/d/motoryzacja/samochody/wroclaw/?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
-const OTOMOTO_SEARCH_URL =
-  process.env.OTOMOTO_SEARCH_URL ||
+
+const OTOMOTO_START_URL =
+  process.env.OTOMOTO_START_URL ||
   'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
 
 /* ===================== APP ===================== */
@@ -126,86 +139,118 @@ function chunk(str, n=3500){ const a=[]; let s=String(str); while(s.length>n){le
 
 /* ===================== Utils ===================== */
 const norm   = s => String(s||'').replace(/\s+/g,' ').trim();
-const priceN = s => { const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; };
-const yearOf = t => { const m=String(t).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
+const priceN = s => {
+  if (s == null) return null;
+  if (typeof s === 'number') return Number.isFinite(s) ? s : null;
+  const n=Number(String(s).replace(/[^\d]/g,''));
+  return Number.isFinite(n)?n:null;
+};
+const yearOf = t => { const m=String(t||'').match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
 function splitMM(title=''){
   const p=norm(title).split(' ').filter(Boolean);
   return { make:(p[0]||'Unknown'), model:(p.slice(1,3).join(' ')||'UNKNOWN') };
 }
-const withPage = (url,p)=> p<=1?url : url+(url.includes('?')?`&page=${p}`:`?page=${p}`);
 
-/* ===================== Puppeteer ===================== */
-let browser = null;
-
-async function launchBrowser() {
-  if (browser) return browser;
-
-  // 1) пробуем путь из ENV (если прописан),
-  // 2) иначе берём путь из встроенной функции Puppeteer (ищет в /opt/render/.cache/puppeteer)
-  const execPath =
-    process.env.PUPPETEER_EXECUTABLE_PATH ||
-    (await executablePath());
-
-  console.log('Puppeteer execPath:', execPath);
-
-  browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath: execPath,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--single-process',
-      '--no-zygote',
-      '--disable-gpu'
-    ]
+/* ===================== Apify helpers ===================== */
+/**
+ * Бьём в актор через "run-sync-get-dataset-items" и сразу получаем JSON.
+ * @param {string} actorSlug e.g. "ecomscrape/olx-product-search-scraper"
+ * @param {object} input — см. описание актора
+ * @returns {Promise<Array<Object>>} items
+ */
+async function apifyRunGetItems(actorSlug, input) {
+  const url = `https://api.apify.com/v2/acts/${actorSlug.replace('/','~')}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify(input || {})
   });
-  return browser;
-}
-
-async function getHtml(url){
-  const b = await launchBrowser();
-  const page = await b.newPage();
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
-  await page.setExtraHTTPHeaders({ 'Accept-Language':'pl-PL,pl;q=0.9,en;q=0.8' });
-  await page.setViewport({ width: 1366, height: 900 });
-  await page.setRequestInterception(true);
-  page.on('request', req => ['image','media','font'].includes(req.resourceType()) ? req.abort() : req.continue());
-  await page.goto(url, { waitUntil:'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(700);
-  const html = await page.content();
-  await page.close();
-  return html;
-}
-
-/* ===================== Scrapers (regex по HTML) ===================== */
-async function parseHtml(html, site){
-  const re = /<a[^>]*href="([^"]+)"[^>]*>(?:.*?)<\/a>.*?(?:<h2[^>]*>|<h3[^>]*>|<h6[^>]*|data-testid="ad-title")[^>]*>(.*?)<\/(?:h2|h3|h6|a)>.*?(?:data-testid="ad-price"[^>]*>|\bclass="[^"]*(?:ooa-1bmnxg7|css-13afqrm|css-1q7qk2x)[^"]*")[^>]*>(.*?)</gis;
-  const items=[]; let m;
-  while ((m = re.exec(html)) !== null) {
-    let url = m[1]; const title = norm(m[2].replace(/<[^>]+>/g,''));
-    const price = priceN(m[3]);
-    if (!url || !title || !price) continue;
-    if (!/^https?:\/\//!i.test(url)) url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
-    const year = yearOf(title); const { make, model } = splitMM(title);
-    items.push({
-      id: (url.split('/').filter(Boolean).pop()||url).replace(/[^0-9a-z\-]/gi,''),
-      title, make, model, year, price, url
-    });
+  if (!r.ok) {
+    const t = await r.text().catch(()=> '');
+    throw new Error(`Apify ${actorSlug} HTTP ${r.status} ${t?.slice(0,200)}`);
   }
-  return items.filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
+  const items = await r.json();
+  return Array.isArray(items) ? items : [];
 }
-async function parseSite(baseUrl, site){
+
+/* ===== Маппинг OLX результата в нашу структуру =====
+   OLX Product Search Scraper (ecomscrape):
+   поля обычно: id / url / name / price / details[] (model/year/...)
+*/
+function mapOlx(items=[]) {
   const out=[];
-  for (let p=1; p<=PAGES; p++){
-    const html = await getHtml(withPage(baseUrl,p));
-    out.push(...await parseHtml(html, site));
-    await new Promise(r => setTimeout(r, 300 + Math.random()*500));
+  for (const it of items) {
+    const id = String(it.id || it.uuid || it.url || '').replace(/[^0-9a-z\-]/gi,'');
+    const title = norm(it.name || it.title || '');
+    const price = priceN(it.price || it.price_number || it.priceValue || (it.price_text||''));
+    const url   = it.url || it.link || '';
+    if (!id || !title || !price || !url) continue;
+
+    let year = Number(it.year || it.production_year || null);
+    if (!year) year = yearOf(title);
+
+    // попробуем достать make/model из деталей
+    let make=null, model=null;
+    if (Array.isArray(it.details)) {
+      for (const d of it.details) {
+        const key = String(d.key||'').toLowerCase();
+        if (!make && (key==='make' || key==='brand')) make = d.value || d.normalized_value || null;
+        if (!model && key==='model') model = d.value || d.normalized_value || null;
+        if (!year && key==='year') year = Number(d.value || d.normalized_value);
+      }
+    }
+    if (!make || !model) {
+      const mm = splitMM(title); make = make || mm.make; model = model || mm.model;
+    }
+    out.push({ id, title, make, model, year, price, url });
   }
   return out;
 }
-const parseOlxList     = () => parseSite(OLX_SEARCH_URL, 'OLX');
-const parseOtomotoList = () => parseSite(OTOMOTO_SEARCH_URL, 'OTOMOTO');
+
+/* ===== Маппинг OTOMOTO результата =====
+   Otomoto.pl Scraper (lexis-solutions/otomoto):
+   обычно: id / url / title / price / year / make / model
+*/
+function mapOtomoto(items=[]) {
+  const out=[];
+  for (const it of items) {
+    const id = String(it.id || it.ad_id || it.url || '').replace(/[^0-9a-z\-]/gi,'');
+    const title = norm(it.title || it.name || '');
+    const price = priceN(it.price || it.price_number || it.priceValue || (it.price_text||''));
+    const url   = it.url || it.link || '';
+    if (!id || !title || !price || !url) continue;
+
+    const make  = it.make || it.brand || splitMM(title).make;
+    const model = it.model || splitMM(title).model;
+    let year    = Number(it.year || it.production_year || null);
+    if (!year) year = yearOf(title);
+
+    out.push({ id, title, make, model, year, price, url });
+  }
+  return out;
+}
+
+/* ===== Обёртки источников через Apify ===== */
+async function parseOlxList() {
+  const input = {
+    startUrls: [{ url: OLX_START_URL }],
+    maxItems: MAX_ITEMS
+  };
+  const items = await apifyRunGetItems(OLX_ACTOR, input);
+  return mapOlx(items)
+    .filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
+}
+
+async function parseOtomotoList() {
+  // у community-актора поля могут отличаться; стартового URL достаточно
+  const input = {
+    startUrls: [{ url: OTOMOTO_START_URL }],
+    maxItems: MAX_ITEMS
+  };
+  const items = await apifyRunGetItems(OTOMOTO_ACTOR, input);
+  return mapOtomoto(items)
+    .filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
+}
 
 /* ===================== Monitor loop ===================== */
 let timer=null;
@@ -289,18 +334,21 @@ async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
 }
 
 /* ===================== Routes + Webhook ===================== */
-app.get('/', (_req,res)=>res.send('lemexicars online 🚗'));
+app.get('/', (_req,res)=>res.send('lemexicars online 🚗 (Apify)'));
 app.get('/health', (_req,res)=>res.json({ ok:true }));
 
-// диагностика браузера
-app.get('/chrome', async (_req, res) => {
+// Диагностика: смотреть, что отдаёт Apify прямо сейчас
+app.get('/olx-test', async (_req, res) => {
   try {
-    const b = await launchBrowser();
-    const ver = await b.version();
-    res.json({ ok:true, version: ver });
-  } catch (e) {
-    res.json({ ok:false, error: e.message });
-  }
+    const data = await parseOlxList();
+    res.json({ ok:true, count: data.length, sample: data.slice(0,5) });
+  } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+app.get('/otomoto-test', async (_req, res) => {
+  try {
+    const data = await parseOtomotoList();
+    res.json({ ok:true, count: data.length, sample: data.slice(0,5) });
+  } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
 // опционально: быстрый сет вебхука
@@ -340,7 +388,7 @@ app.post('/tg', async (req,res)=>{
 
     } else if (/^\/watch\b/i.test(text)) {
       const m=text.match(/\/watch\s+(\d+)/i); const every=m?Number(m[1]):15;
-      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})\nФильтры: Wrocław+100km, ${PRICE_MIN}–${PRICE_MAX} PLN.`);
+      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (источники: OLX+Otomoto, max ${MAX_ITEMS} элементов).`);
       startMonitor(every); monitorOnce().catch(e=>console.error('first run',e));
 
     } else if (/^\/stop\b/i.test(text)) {
@@ -358,11 +406,11 @@ app.post('/tg', async (req,res)=>{
         i.notes?.length ? `Заметки: ${i.notes.join(' | ')}` : '',
         `База: ads_seen=${seenCount[0]?.c||0}, model_stats=${statsCount[0]?.c||0}`,
         `Фильтр: ${PRICE_MIN}–${PRICE_MAX} PLN, hot=${Math.round(HOT_THRESHOLD*100)}%`,
-        `TOP: окно ${TOP_DAYS_DEFAULT} дн., мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%, страниц=${PAGES}`
+        `TOP: окно ${TOP_DAYS_DEFAULT} дн., мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%, maxItems=${MAX_ITEMS}`
       ].filter(Boolean).join('\n'));
 
     } else if (/^\/scan\b/i.test(text)) {
-      await reply(chatId, '🔎 Делаю разовый обход источников…');
+      await reply(chatId, '🔎 Делаю разовый обход источников через Apify…');
       try {
         const info = await monitorOnce();
         await reply(chatId, `Готово. Найдено: ${info.found}, отправлено: ${info.sent}. Теперь можно смотреть /top.`);
@@ -407,14 +455,6 @@ app.post('/tg', async (req,res)=>{
   }
 });
 
-/* ===================== Start & graceful shutdown ===================== */
+/* ===================== Start ===================== */
 const PORT = process.env.PORT || 8080;
-const server = app.listen(PORT, () => console.log('lemexicars up on', PORT));
-
-async function shutdown() {
-  try { if (browser) await browser.close(); } catch {}
-  try { if (pool) await pool.end(); } catch {}
-  try { server.close(()=>process.exit(0)); } catch { process.exit(0); }
-}
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+app.listen(PORT, () => console.log('lemexicars (Apify) up on', PORT));
