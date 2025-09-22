@@ -5,7 +5,7 @@ import fetch from 'node-fetch';
 import puppeteer from 'puppeteer-core';
 import { Pool } from 'pg';
 
-/* ============== ENV ============== */
+/* ===================== ENV ===================== */
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ALLOWED = (process.env.ALLOWED_CHAT_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -13,14 +13,20 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || CHAT_ALLOWED[0];
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
+// фильтры
 const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
-const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 0.85);        // 85% от средней
-const HOT_DISCOUNT_MIN = Number(process.env.HOT_DISCOUNT_MIN || 0.20);  // для /top
-const TOP_DAYS_DEFAULT = Number(process.env.TOP_DAYS_DEFAULT || 7);
+
+// «горячее предложение» — цена <= 85% от средней
+const HOT_THRESHOLD     = Number(process.env.HOT_THRESHOLD || 0.85);
+// для /top считаем «выгодными» скидки >= 20%
+const HOT_DISCOUNT_MIN  = Number(process.env.HOT_DISCOUNT_MIN || 0.20);
+const TOP_DAYS_DEFAULT  = Number(process.env.TOP_DAYS_DEFAULT || 7);
+
+// сколько страниц пролистывать у каждого источника
 const PAGES = Number(process.env.PAGES || 3);
 
-// эти URL можно переопределить через переменные окружения
+// поисковые URL (можно переопределить в ENV)
 const OLX_SEARCH_URL =
   process.env.OLX_SEARCH_URL ||
   'https://www.olx.pl/d/motoryzacja/samochody/wroclaw/?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
@@ -29,28 +35,28 @@ const OTOMOTO_SEARCH_URL =
   process.env.OTOMOTO_SEARCH_URL ||
   'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
 
-// главное: путь к браузеру кладём в .env / Dockerfile
-const EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH; // напр. /usr/bin/google-chrome
+// главный герой: путь до браузера, который задаёт Dockerfile
+const EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH;
 
-/* ============== APP ============== */
+/* ===================== APP ===================== */
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-/* ============== DB (Neon/Postgres) ============== */
+/* ===================== DB (Neon/Postgres) ===================== */
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ads_seen (
-      site TEXT NOT NULL,
+      site  TEXT NOT NULL,
       ad_id TEXT NOT NULL,
       title TEXT,
-      make TEXT,
+      make  TEXT,
       model TEXT,
-      year INTEGER,
+      year  INTEGER,
       price NUMERIC,
-      url TEXT,
+      url   TEXT,
       seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (site, ad_id)
     );
@@ -85,11 +91,10 @@ async function markSeen(site, ad) {
 async function updateStats(ad) {
   const { make, model, year, price } = ad || {};
   if (!make || !model || !year || !price) return { old_avg:null, new_avg:null, new_count:null };
-  const key = [make, model, year];
-  const { rows } = await pool.query(
-    'SELECT count, avg_price FROM model_stats WHERE make=$1 AND model=$2 AND year=$3',
-    key
-  );
+
+  const q = 'SELECT count, avg_price FROM model_stats WHERE make=$1 AND model=$2 AND year=$3';
+  const { rows } = await pool.query(q, [make, model, year]);
+
   if (!rows.length) {
     await pool.query(
       'INSERT INTO model_stats(make,model,year,count,avg_price) VALUES($1,$2,$3,1,$4)',
@@ -98,9 +103,9 @@ async function updateStats(ad) {
     return { old_avg:null, new_avg:Number(price), new_count:1 };
   } else {
     const old_count = Number(rows[0].count);
-    const old_avg = Number(rows[0].avg_price);
+    const old_avg   = Number(rows[0].avg_price);
     const new_count = old_count + 1;
-    const new_avg = (old_avg * old_count + Number(price)) / new_count;
+    const new_avg   = (old_avg * old_count + Number(price)) / new_count;
     await pool.query(
       'UPDATE model_stats SET count=$1, avg_price=$2 WHERE make=$3 AND model=$4 AND year=$5',
       [new_count, new_avg, make, model, year]
@@ -109,7 +114,7 @@ async function updateStats(ad) {
   }
 }
 
-/* ============== Telegram helpers ============== */
+/* ===================== Telegram helpers ===================== */
 async function tg(method, payload) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const r = await fetch(url, {
@@ -128,21 +133,24 @@ async function reply(chatId, text) {
 async function notify(text) { if (TELEGRAM_CHAT_ID) return reply(TELEGRAM_CHAT_ID, text); }
 function chunk(str, n=3500){ const a=[]; let s=String(str); while(s.length>n){let i=s.lastIndexOf('\n',n); if(i<0)i=n; a.push(s.slice(0,i)); s=s.slice(i);} if(s)a.push(s); return a; }
 
-/* ============== Utils ============== */
-const norm = s => String(s||'').replace(/\s+/g,' ').trim();
-const priceNum = s => { const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; };
-const yearFrom = t => { const m=String(t).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
+/* ===================== Utils ===================== */
+const norm   = s => String(s||'').replace(/\s+/g,' ').trim();
+const priceN = s => { const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; };
+const yearOf = t => { const m=String(t).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
 function splitMM(title=''){ const p=norm(title).split(' ').filter(Boolean); return { make:p[0]||'Unknown', model:p.slice(1,3).join(' ')||'UNKNOWN' }; }
 const withPage = (url,p)=> p<=1?url : url+(url.includes('?')?`&page=${p}`:`?page=${p}`);
 
-/* ============== Puppeteer (обязательно указываем путь) ============== */
+/* ===================== Puppeteer-core ===================== */
 let browser = null;
+
 async function getHtml(url){
-  if (!EXECUTABLE_PATH) throw new Error('PUPPETEER_EXECUTABLE_PATH is not set');
+  if (!EXECUTABLE_PATH) {
+    throw new Error('PUPPETEER_EXECUTABLE_PATH is not set');
+  }
   if (!browser) {
     browser = await puppeteer.launch({
       headless: 'new',
-      executablePath: EXECUTABLE_PATH,
+      executablePath: EXECUTABLE_PATH,      // <-- из Dockerfile
       args: ['--no-sandbox','--disable-dev-shm-usage','--single-process']
     });
   }
@@ -150,6 +158,8 @@ async function getHtml(url){
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
   await page.setExtraHTTPHeaders({ 'Accept-Language':'pl-PL,pl;q=0.9,en;q=0.8' });
   await page.setViewport({ width: 1366, height: 900 });
+
+  // экономим трафик
   await page.setRequestInterception(true);
   page.on('request', req => ['image','media','font'].includes(req.resourceType()) ? req.abort() : req.continue());
 
@@ -160,17 +170,19 @@ async function getHtml(url){
   return html;
 }
 
-/* ============== Scrapers (regex по html) ============== */
+/* ===================== Scrapers (regex по HTML) ===================== */
 async function parseHtml(html, site){
-  // выдергиваем url, title, price из карточек для OLX/OTOMOTO
+  // грубый, но быстрый парсер карточек (url, title, price)
   const re = /<a[^>]*href="([^"]+)"[^>]*>(?:.*?)<\/a>.*?(?:<h2[^>]*>|<h3[^>]*>|<h6[^>]*|data-testid="ad-title")[^>]*>(.*?)<\/(?:h2|h3|h6|a)>.*?(?:data-testid="ad-price"[^>]*>|\bclass="[^"]*(?:ooa-1bmnxg7|css-13afqrm|css-1q7qk2x)[^"]*")[^>]*>(.*?)</gis;
   const items=[]; let m;
   while ((m = re.exec(html)) !== null) {
     let url = m[1]; const title = norm(m[2].replace(/<[^>]+>/g,''));
-    const price = priceNum(m[3]); if (!url || !title || !price) continue;
+    const price = priceN(m[3]);
+    if (!url || !title || !price) continue;
+
     if (!/^https?:\/\//i.test(url)) url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
 
-    const year = yearFrom(title); const { make, model } = splitMM(title);
+    const year = yearOf(title); const { make, model } = splitMM(title);
     items.push({
       id: (url.split('/').filter(Boolean).pop()||url).replace(/[^0-9a-z\-]/gi,''),
       title, make, model, year, price, url
@@ -178,17 +190,16 @@ async function parseHtml(html, site){
   }
   return items.filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
 }
-
 async function parseSite(baseUrl, site){
   const out=[]; for (let p=1; p<=PAGES; p++){
     const html = await getHtml(withPage(baseUrl,p));
     out.push(...await parseHtml(html, site));
   } return out;
 }
-const parseOlxList = () => parseSite(OLX_SEARCH_URL, 'OLX');
+const parseOlxList     = () => parseSite(OLX_SEARCH_URL, 'OLX');
 const parseOtomotoList = () => parseSite(OTOMOTO_SEARCH_URL, 'OTOMOTO');
 
-/* ============== Monitor loop ============== */
+/* ===================== Monitor loop ===================== */
 let timer=null;
 let lastRunInfo = { ts:null, found:0, sent:0, notes:[] };
 
@@ -232,7 +243,7 @@ async function monitorOnce(){
 function startMonitor(mins=15){ if (timer) clearInterval(timer); timer=setInterval(monitorOnce, Math.max(1,mins)*60*1000); }
 function stopMonitor(){ if (timer) clearInterval(timer); timer=null; }
 
-/* ============== /top из базы ============== */
+/* ===================== /top из базы ===================== */
 async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
   await initDb();
   const sql = `
@@ -269,7 +280,7 @@ async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
   return rows;
 }
 
-/* ============== Routes + Webhook ============== */
+/* ===================== Routes + Webhook ===================== */
 app.get('/', (_req,res)=>res.send('lemexicars online 🚗'));
 app.get('/health', (_req,res)=>res.json({ ok:true }));
 
@@ -294,7 +305,7 @@ app.post('/tg', async (req,res)=>{
         '/watch [мин] — запустить мониторинг (по умолчанию 15)',
         '/stop — остановить мониторинг',
         '/status — статус и метрики',
-        `/scan — разовый обход источников`,
+        '/scan — разовый обход источников',
         `/top [N] [days] — топ скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%)`
       ].join('\n'));
 
@@ -367,6 +378,6 @@ app.post('/tg', async (req,res)=>{
   }
 });
 
-/* ============== Start ============== */
+/* ===================== Start ===================== */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('lemexicars up on', PORT));
