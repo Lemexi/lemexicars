@@ -2,12 +2,11 @@ import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import fetch from 'node-fetch';
+import fs from 'fs';
 import puppeteer from 'puppeteer-core';
 import { Pool } from 'pg';
 
-/* ─────────────────────────────────────────
-   0) ENV
-   ───────────────────────────────────────── */
+/* ================= ENV ================= */
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ALLOWED = (process.env.ALLOWED_CHAT_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -19,6 +18,8 @@ const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
 const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 0.85); // 85% от средней
 
+const TOP_DAYS_DEFAULT = Number(process.env.TOP_DAYS_DEFAULT || 7);
+const HOT_DISCOUNT_MIN = Number(process.env.HOT_DISCOUNT_MIN || 0.20);   // для /top
 const PAGES = Number(process.env.PAGES || 3);
 
 const OLX_SEARCH_URL =
@@ -29,16 +30,12 @@ const OTOMOTO_SEARCH_URL =
   process.env.OTOMOTO_SEARCH_URL ||
   'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
 
-/* ─────────────────────────────────────────
-   1) APP
-   ───────────────────────────────────────── */
+/* ================ APP ================ */
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-/* ─────────────────────────────────────────
-   2) DB (Neon)
-   ───────────────────────────────────────── */
+/* ================ DB (Neon) ================ */
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function initDb() {
@@ -69,7 +66,7 @@ async function initDb() {
 }
 
 async function alreadySeen(site, adId) {
-  if (!site || !adId) return true; // не лезем в БД с пустыми значениями
+  if (!site || !adId) return true;
   const { rows } = await pool.query(
     'SELECT 1 FROM ads_seen WHERE site=$1 AND ad_id=$2 LIMIT 1',
     [site, adId]
@@ -111,9 +108,7 @@ async function updateStats(ad) {
   }
 }
 
-/* ─────────────────────────────────────────
-   3) Telegram helpers
-   ───────────────────────────────────────── */
+/* ================ Telegram ================ */
 async function tg(method, payload) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const r = await fetch(url, {
@@ -130,35 +125,31 @@ async function reply(chatId, text) {
   return tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: false });
 }
 async function notify(text) { if (!TELEGRAM_CHAT_ID) return; return reply(TELEGRAM_CHAT_ID, text); }
-function chunkMessages(str, maxLen = 3500) {
-  const out = []; let s = String(str);
-  while (s.length > maxLen) {
-    let cut = s.lastIndexOf('\n', maxLen); if (cut < 0) cut = maxLen;
-    out.push(s.slice(0, cut)); s = s.slice(cut);
-  }
-  if (s) out.push(s); return out;
-}
+function chunk(str, n=3500){ const a=[]; let s=String(str); while(s.length>n){let i=s.lastIndexOf('\n',n); if(i<0)i=n; a.push(s.slice(0,i)); s=s.slice(i);} if(s)a.push(s); return a; }
 
-/* ─────────────────────────────────────────
-   4) Utils
-   ───────────────────────────────────────── */
-function normSpaces(s=''){ return String(s||'').replace(/\s+/g,' ').trim(); }
-function parsePriceToNumber(s=''){ const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; }
-function extractYear(title=''){ const m=String(title).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; }
-function splitMakeModel(title=''){
-  const t=normSpaces(title), parts=t.split(' ').filter(Boolean);
-  const make=parts[0]||'Unknown'; const model=parts.slice(1,3).join(' ')||'UNKNOWN';
-  return { make, model };
-}
-function withPage(url, p){ return p<=1?url : url+(url.includes('?')?`&page=${p}`:`?page=${p}`); }
+/* ================ Utils ================ */
+function norm(s=''){ return String(s||'').replace(/\s+/g,' ').trim(); }
+function priceNum(s=''){ const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; }
+function yearFrom(title=''){ const m=String(title).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; }
+function splitMM(title=''){ const p=norm(title).split(' ').filter(Boolean); return { make:p[0]||'Unknown', model:p.slice(1,3).join(' ')||'UNKNOWN' }; }
+function withPage(url,p){ return p<=1?url : url + (url.includes('?')?`&page=${p}`:`?page=${p}`); }
 
-/* ─────────────────────────────────────────
-   5) Puppeteer
-   ───────────────────────────────────────── */
-const EXEC_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium'; // из Dockerfile
+/* ============== Puppeteer (Chrome path) ============== */
+const EXEC_PATH = (() => {
+  const env = process.env.PUPPETEER_EXECUTABLE_PATH;
+  const candidates = [
+    env,
+    '/usr/bin/google-chrome',         // puppeteer official image
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser'
+  ].filter(Boolean);
+  for (const p of candidates) { try { if (fs.existsSync(p)) return p; } catch {} }
+  return undefined; // пусть решит сам, но в нашем образе путь есть
+})();
+
 let browser = null;
-
-async function getHtmlWithBrowser(url) {
+async function getHtml(url){
   if (!browser) {
     browser = await puppeteer.launch({
       headless: 'new',
@@ -168,13 +159,10 @@ async function getHtmlWithBrowser(url) {
   }
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
-  await page.setExtraHTTPHeaders({ 'Accept-Language': 'pl-PL,pl;q=0.9,en;q=0.8' });
+  await page.setExtraHTTPHeaders({ 'Accept-Language':'pl-PL,pl;q=0.9,en;q=0.8' });
   await page.setViewport({ width: 1366, height: 900 });
   await page.setRequestInterception(true);
-  page.on('request', req => {
-    if (['image','media','font'].includes(req.resourceType())) return req.abort();
-    req.continue();
-  });
+  page.on('request', req => ['image','media','font'].includes(req.resourceType()) ? req.abort() : req.continue());
 
   await page.goto(url, { waitUntil:'domcontentloaded', timeout: 45000 });
   await page.waitForTimeout(600);
@@ -183,53 +171,40 @@ async function getHtmlWithBrowser(url) {
   return html;
 }
 
-/* ─────────────────────────────────────────
-   6) Parsers (через браузер, по 1..PAGES)
-   ───────────────────────────────────────── */
-async function scrapeCardsFromHtml(html, siteBase){
-  // Небольшой парсер на основе DOM-структур обеих площадок
-  // (берём <article> или div.css-1sw7q4x)
-  const pattern = /<a[^>]*href="([^"]+)"[^>]*>(?:.*?)<\/a>.*?(?:<h2[^>]*>|<h3[^>]*>|<h6[^>]*>|data-testid="ad-title")[^>]*>(.*?)<\/(?:h2|h3|h6|a)>.*?(?:data-testid="ad-price"[^>]*>|\bclass="[^"]*(?:ooa-1bmnxg7|css-13afqrm|css-1q7qk2x)[^"]*")[^>]*>(.*?)</gis;
+/* ============== Parsers (regex по html) ============== */
+async function parseHtml(html, site){
+  // обобщённый выдёргиватель ссылок/титулов/цен для OLX+OTOMOTO
+  const re = /<a[^>]*href="([^"]+)"[^>]*>(?:.*?)<\/a>.*?(?:<h2[^>]*>|<h3[^>]*>|<h6[^>]*|data-testid="ad-title")[^>]*>(.*?)<\/(?:h2|h3|h6|a)>.*?(?:data-testid="ad-price"[^>]*>|\bclass="[^"]*(?:ooa-1bmnxg7|css-13afqrm|css-1q7qk2x)[^"]*")[^>]*>(.*?)</gis;
+  const items=[]; let m;
+  while ((m = re.exec(html)) !== null) {
+    let url = m[1]; const title = norm(m[2].replace(/<[^>]+>/g,''));
+    const price = priceNum(m[3]);
+    if (!url || !title || !price) continue;
 
-  const items = [];
-  let m;
-  while ((m = pattern.exec(html)) !== null) {
-    let url = m[1]; const titleRaw = m[2]; const priceRaw = m[3];
-    if (!url || !titleRaw || !priceRaw) continue;
     if (!/^https?:\/\//i.test(url)) {
-      const host = siteBase === 'OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl';
-      url = host + url;
+      url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
     }
-    const title = normSpaces(titleRaw.replace(/<[^>]+>/g,''));
-    const price = parsePriceToNumber(priceRaw);
-    if (!price) continue;
-
-    const year = extractYear(title);
-    const { make, model } = splitMakeModel(title);
+    const year = yearFrom(title); const { make, model } = splitMM(title);
     items.push({
-      id: (url.split('/').filter(Boolean).pop() || url).replace(/[^0-9a-z\-]/gi,''),
+      id: (url.split('/').filter(Boolean).pop()||url).replace(/[^0-9a-z\-]/gi,''),
       title, make, model, year, price, url
     });
   }
   return items.filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
 }
 
-async function parseSite(baseUrl, siteName) {
-  const all = [];
-  for (let p=1; p<=PAGES; p++) {
-    const html = await getHtmlWithBrowser(withPage(baseUrl, p));
-    const chunk = await scrapeCardsFromHtml(html, siteName);
+async function parseSite(baseUrl, site){
+  const all=[]; for (let p=1; p<=PAGES; p++){
+    const html = await getHtml(withPage(baseUrl,p));
+    const chunk = await parseHtml(html, site);
     all.push(...chunk);
-  }
-  return all;
+  } return all;
 }
 const parseOlxList = () => parseSite(OLX_SEARCH_URL, 'OLX');
 const parseOtomotoList = () => parseSite(OTOMOTO_SEARCH_URL, 'OTOMOTO');
 
-/* ─────────────────────────────────────────
-   7) Monitor
-   ───────────────────────────────────────── */
-let timer = null;
+/* ============== Monitor ============== */
+let timer=null;
 let lastRunInfo = { ts:null, found:0, sent:0, notes:[] };
 
 async function monitorOnce(){
@@ -238,108 +213,142 @@ async function monitorOnce(){
   const sources=[ {name:'OLX', fn:parseOlxList}, {name:'OTOMOTO', fn:parseOtomotoList} ];
 
   for (const s of sources){
-    try {
-      const ads = await s.fn();
-      found += ads.length;
-
-      for (const ad of ads) {
-        const seen = await alreadySeen(s.name.toLowerCase(), ad.id);
-        if (seen) continue;
+    try{
+      const ads = await s.fn(); found += ads.length;
+      for (const ad of ads){
+        if (await alreadySeen(s.name.toLowerCase(), ad.id)) continue;
         await markSeen(s.name.toLowerCase(), ad);
         const st = await updateStats(ad);
 
-        let isHot = false;
+        let hot=false;
         if (st.old_avg !== null && Number(st.old_avg) > 0) {
-          if (Number(ad.price) <= Number(st.old_avg) * HOT_THRESHOLD) isHot = true;
+          hot = Number(ad.price) <= Number(st.old_avg) * HOT_THRESHOLD;
         }
 
-        let text =
-          (isHot ? '🔥 ГОРЯЧЕЕ ПРЕДЛОЖЕНИЕ!\n' : '') +
-          `${s.name}: ${ad.title}\n` +
-          `Цена: ${ad.price} PLN\n` +
-          `Марка: ${ad.make}\n` +
-          `Модель: ${ad.model}\n` +
-          `Год: ${ad.year || '—'}\n` +
-          `${ad.url}\n`;
-
+        let text = (hot ? '🔥 ГОРЯЧЕЕ ПРЕДЛОЖЕНИЕ!\n' : '') +
+          `${s.name}: ${ad.title}\nЦена: ${ad.price} PLN\nМарка: ${ad.make}\nМодель: ${ad.model}\nГод: ${ad.year || '—'}\n${ad.url}\n`;
         if (st.new_count) {
           const avg = Number(st.old_avg ?? st.new_avg);
           if (avg && Number.isFinite(avg)) {
             text += `Средняя (${st.new_count}) для ${ad.make} ${ad.model} ${ad.year || ''}: ${Math.round(avg)} PLN\n`;
-            if (isHot) text += `Порог: ${Math.round(HOT_THRESHOLD*100)}% от средней\n`;
+            if (hot) text += `Порог: ${Math.round(HOT_THRESHOLD*100)}% от средней\n`;
           }
         }
-
-        await notify(text);
-        sent++;
+        await notify(text); sent++;
       }
-    } catch (e) {
-      notes.push(`${s.name} error: ${e.message}`);
-      console.error(`${s.name} error`, e);
+    }catch(e){
+      notes.push(`${s.name} error: ${e.message}`); console.error(`${s.name} error`, e);
     }
   }
 
-  lastRunInfo = { ts:new Date().toISOString(), found, sent, notes };
+  lastRunInfo = { ts: new Date().toISOString(), found, sent, notes };
   return lastRunInfo;
 }
 
-function startMonitor(everyMinutes=15){
-  if (timer) clearInterval(timer);
-  timer = setInterval(monitorOnce, Math.max(1,everyMinutes)*60*1000);
-}
+function startMonitor(mins=15){ if (timer) clearInterval(timer); timer=setInterval(monitorOnce, Math.max(1,mins)*60*1000); }
 function stopMonitor(){ if (timer) clearInterval(timer); timer=null; }
 
-/* ─────────────────────────────────────────
-   8) Routes + Webhook
-   ───────────────────────────────────────── */
-app.get('/', (_req,res) => res.send('lemexicars online 🚗'));
-app.get('/health', (_req,res) => res.json({ ok:true }));
+/* ============== /top из базы за окно ============== */
+async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
+  await initDb();
+  const sql = `
+    WITH recent AS (
+      SELECT site, ad_id, title, make, model, year, price::numeric AS price, url, seen_at
+      FROM ads_seen
+      WHERE seen_at >= NOW() - INTERVAL $1
+        AND price BETWEEN $2 AND $3
+    ),
+    avg_mmy AS (
+      SELECT make, model, year, AVG(price)::numeric AS avg_price, COUNT(*) cnt
+      FROM recent WHERE make IS NOT NULL AND model IS NOT NULL
+      GROUP BY make, model, year
+    ),
+    avg_mm AS (
+      SELECT make, model, AVG(price)::numeric AS avg_price_mm, COUNT(*) cnt_mm
+      FROM recent WHERE make IS NOT NULL AND model IS NOT NULL
+      GROUP BY make, model
+    )
+    SELECT r.*,
+           COALESCE(a.avg_price, am.avg_price_mm) AS avg_price,
+           CASE WHEN COALESCE(a.avg_price, am.avg_price_mm, 0) > 0
+                THEN (1 - (r.price / COALESCE(a.avg_price, am.avg_price_mm)))::numeric
+                ELSE NULL END AS discount
+    FROM recent r
+    LEFT JOIN avg_mmy a ON a.make=r.make AND a.model=r.model AND (a.year=r.year OR (a.year IS NULL AND r.year IS NULL))
+    LEFT JOIN avg_mm  am ON am.make=r.make AND am.model=r.model
+    WHERE COALESCE(a.avg_price, am.avg_price_mm) IS NOT NULL
+      AND (1 - (r.price / COALESCE(a.avg_price, am.avg_price_mm))) >= $4
+    ORDER BY discount DESC NULLS LAST, r.seen_at DESC
+    LIMIT $5
+  `;
+  const { rows } = await pool.query(sql, [`${days} days`, PRICE_MIN, PRICE_MAX, HOT_DISCOUNT_MIN, N]);
+  return rows;
+}
 
-app.post('/tg', async (req,res) => {
+/* ============== Routes + Webhook ============== */
+app.get('/', (_req,res)=>res.send('lemexicars online 🚗'));
+app.get('/health', (_req,res)=>res.json({ ok:true }));
+
+app.post('/tg', async (req,res)=>{
   try{
-    const update = req.body;
-    const msg = update.message || update.edited_message || update.channel_post;
+    const update=req.body;
+    const msg=update.message || update.edited_message || update.channel_post;
     if (!msg) return res.json({ ok:true });
 
     const chatId = msg.chat?.id;
     const text = (msg.text || '').trim();
 
-    if (!isAllowed(chatId)) {
-      await reply(chatId, 'У вас нет прав');
-      return res.json({ ok:true });
-    }
+    if (!isAllowed(chatId)) { await reply(chatId,'У вас нет прав'); return res.json({ ok:true }); }
 
     if (/^\/ping\b/i.test(text)) {
-      await reply(chatId, 'pong ✅');
+      await reply(chatId,'pong ✅');
     } else if (/^\/help\b/i.test(text)) {
-      await reply(chatId, [
+      await reply(chatId,[
         'Команды:',
         '/ping — проверить связь',
-        '/watch [минуты] — запустить мониторинг (по умолчанию 15)',
+        '/watch [мин] — запустить мониторинг (по умолчанию 15)',
         '/stop — остановить мониторинг',
-        '/status — статус последнего прогона'
+        '/status — статус и метрики',
+        `/top [N] [days] — топ N скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%) за days дней`
       ].join('\n'));
     } else if (/^\/watch\b/i.test(text)) {
-      const m = text.match(/\/watch\s+(\d+)/i);
-      const every = m ? Number(m[1]) : 15;
-      await reply(chatId, `⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})\nФильтры: Wrocław+100km, ${PRICE_MIN}–${PRICE_MAX} PLN.`);
-      startMonitor(every);
-      monitorOnce().catch(e=>console.error('first run', e)); // первый прогон сразу
+      const m=text.match(/\/watch\s+(\d+)/i); const every=m?Number(m[1]):15;
+      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})\nФильтры: Wrocław+100km, ${PRICE_MIN}–${PRICE_MAX} PLN.`);
+      startMonitor(every); monitorOnce().catch(e=>console.error('first run',e));
     } else if (/^\/stop\b/i.test(text)) {
-      stopMonitor();
-      await reply(chatId, '⏹ Мониторинг остановлен.');
+      stopMonitor(); await reply(chatId,'⏹ Мониторинг остановлен.');
     } else if (/^\/status\b/i.test(text)) {
       await initDb();
       const { rows: seenCount } = await pool.query('SELECT COUNT(*)::int AS c FROM ads_seen');
       const { rows: statsCount } = await pool.query('SELECT COUNT(*)::int AS c FROM model_stats');
-      const i = lastRunInfo;
-      await reply(chatId, [
-        `Статус: ${timer ? '🟢 запущен' : '🔴 остановлен'}`,
+      const i=lastRunInfo;
+      await reply(chatId,[
+        `Статус: ${timer?'🟢 запущен':'🔴 остановлен'}`,
         `Последний прогон: ${i.ts || '—'}`,
-        `Найдено: ${i.found || 0}, отправлено: ${i.sent || 0}`,
+        `Найдено: ${i.found||0}, отправлено: ${i.sent||0}`,
         i.notes?.length ? `Заметки: ${i.notes.join(' | ')}` : '',
-        `База: ads_seen=${seenCount[0]?.c || 0}, model_stats=${statsCount[0]?.c || 0}`,
+        `База: ads_seen=${seenCount[0]?.c||0}, model_stats=${statsCount[0]?.c||0}`,
+        `Фильтр: ${PRICE_MIN}–${PRICE_MAX} PLN, hot=${Math.round(HOT_THRESHOLD*100)}%`,
+        `TOP: окно ${TOP_DAYS_DEFAULT} дн., мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%, страниц=${PAGES}`
       ].filter(Boolean).join('\n'));
+    } else if (/^\/top\b/i.test(text)) {
+      await initDb();
+      const m=text.match(/\/top(?:\s+(\d+))?(?:\s+(\d+))?/i);
+      const N=m&&m[1]?Math.max(1,Math.min(30,Number(m[1]))):10;
+      const days=m&&m[2]?Math.max(1,Math.min(90,Number(m[2]))):TOP_DAYS_DEFAULT;
+
+      const rows=await queryTopDeals(N, days);
+      if (!rows.length) { await reply(chatId,`За последние ${days} дн. выгодных предложений (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%) не найдено.`); }
+      else {
+        let out=`🔝 Топ-${rows.length} предложений за ${days} дн. (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%):\n`;
+        rows.forEach((r,i)=>{
+          const avg=Number(r.avg_price); const dPct=Math.round(Number(r.discount||0)*100);
+          out+=`\n${i+1}) ${String(r.site).toUpperCase()}: ${r.title}\n`;
+          out+=`Цена: ${Math.round(Number(r.price))} PLN • Средняя: ${Math.round(avg)} PLN • Скидка: -${dPct}%\n`;
+          out+=`${r.url}\n`;
+        });
+        for (const c of chunk(out)) await reply(chatId,c);
+      }
     }
 
     return res.json({ ok:true });
@@ -349,8 +358,6 @@ app.post('/tg', async (req,res) => {
   }
 });
 
-/* ─────────────────────────────────────────
-   9) Start
-   ───────────────────────────────────────── */
+/* ================ Start ================ */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('lemexicars up on', PORT));
