@@ -1,11 +1,13 @@
 {
-  "name": "lemexicars-olx-bot",
-  "version": "1.1.0",
+  "name": "lemexicars",
+  "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
-  "engines": { "node": ">=18" },
+  "main": "src/server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": "20.x"
   },
   "dependencies": {
     "apify-client": "^2.9.1",
