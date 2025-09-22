@@ -1,9 +1,10 @@
 {
   "name": "lemexicars",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
+    "postinstall": "npx playwright install --with-deps chromium",
     "start": "node server.js"
   },
   "dependencies": {
@@ -12,6 +13,8 @@
     "express": "^4.19.2",
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2",
-    "pg": "^8.12.0"
-  }
+    "pg": "^8.12.0",
+    "playwright": "^1.47.1"
+  },
+  "engines": { "node": ">=18" }
 }
