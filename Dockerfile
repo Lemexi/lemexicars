@@ -1,6 +1,5 @@
 FROM node:20-bullseye
 
-# Устанавливаем Chrome + шрифты
 RUN apt-get update && \
     apt-get install -y wget gnupg ca-certificates && \
     wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
@@ -13,11 +12,8 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome
 ENV NODE_ENV=production
 
 WORKDIR /app
-
 COPY package*.json ./
 RUN npm ci --omit=dev
-
 COPY . .
-
 EXPOSE 8080
-CMD ["node", "server.js"]
+CMD ["node","server.js"]
