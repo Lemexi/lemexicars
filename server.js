@@ -160,7 +160,7 @@ function withPage(url, page){ if(page<=1) return url; return url + (url.includes
 /* ===== Smart fetch: сначала fetch, если 403 → Puppeteer ===== */
 let browser = null;
 async function getHtmlSmart(url) {
-  // 1) пробуем обычный fetch с реалистичным UA
+  // 1) обычный fetch с реалистичным UA
   try {
     const r = await fetch(url, {
       headers: {
@@ -175,9 +175,9 @@ async function getHtmlSmart(url) {
     }
   } catch (_) {}
 
-  // 2) Puppeteer (используем executablePath из установленного Chromium)
+  // 2) Puppeteer (Chromium из node_modules/.local-chromium)
   if (!browser) {
-    const exePath = process.env.PUPPETEER_EXECUTABLE_PATH || (await puppeteer.executablePath());
+    const exePath = process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath();
     browser = await puppeteer.launch({
       headless: 'new',
       executablePath: exePath,
