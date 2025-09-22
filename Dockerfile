@@ -1,29 +1,17 @@
-# Базовый образ с Node 20 (Debian bullseye)
-FROM node:20-bullseye
-
-# Устанавливаем системный Chromium и шрифты
-# Делаем symlink на chromium-browser (на всякий случай)
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    chromium \
-    fonts-liberation \
-    fonts-noto-color-emoji \
-    ca-certificates \
-    --no-install-recommends && \
-    ln -sf /usr/bin/chromium /usr/bin/chromium-browser || true && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Пусть сервер берёт этот путь как дефолтный
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV NODE_ENV=production
+# Образ с Node + уже установленным Chrome
+FROM ghcr.io/puppeteer/puppeteer:21.11.0
 
 WORKDIR /app
 
-# Ставим зависимости
+# Устанавливаем зависимости
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 
 # Копируем исходники
 COPY . .
+
+# В этом образе Chrome доступен по этим путям
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome
 
 EXPOSE 8080
 CMD ["node", "server.js"]
