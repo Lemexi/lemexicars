@@ -17,7 +17,9 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
-const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 0.85);
+const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 0.85);        // 85% от средней
+const TOP_DAYS_DEFAULT = Number(process.env.TOP_DAYS_DEFAULT || 7);     // окно для /top
+const HOT_DISCOUNT_MIN = Number(process.env.HOT_DISCOUNT_MIN || 0.20);  // минимум -20%
 
 const OLX_SEARCH_URL =
   process.env.OLX_SEARCH_URL ||
@@ -138,6 +140,18 @@ async function notify(text) {
   if (!TELEGRAM_CHAT_ID) return;
   return reply(TELEGRAM_CHAT_ID, text);
 }
+function chunkMessages(str, maxLen = 3500) {
+  const out = [];
+  let s = String(str);
+  while (s.length > maxLen) {
+    let cut = s.lastIndexOf('\n', maxLen);
+    if (cut < 0) cut = maxLen;
+    out.push(s.slice(0, cut));
+    s = s.slice(cut);
+  }
+  if (s) out.push(s);
+  return out;
+}
 
 /* ──────────────────────────────────────────────────────────────
    4) Parsers (без API) — OLX, OTOMOTO
@@ -159,7 +173,6 @@ function splitMakeModel(title = '') {
   const head = ym ? t.slice(0, ym.index).trim() : t;
   const parts = head.split(' ').filter(Boolean);
   const make = (parts[0] || '').toLowerCase();
-  // склеим 1–2 слова на модель, чтобы поймать “W211”, “3 Series”, “A4”
   const model = parts.slice(1, 3).join(' ').toLowerCase();
   return {
     make: make ? make[0].toUpperCase() + make.slice(1) : 'Unknown',
@@ -179,57 +192,44 @@ async function fetchHtml(url) {
   return await r.text();
 }
 
-/* OLX: список объявлений.
-   Селекторы подобраны для текущей сетки OLX; если что — правим здесь. */
+/* OLX: список объявлений */
 async function parseOlxList() {
   const html = await fetchHtml(OLX_SEARCH_URL);
   const $ = cheerio.load(html);
 
   const items = [];
-  $('div.css-1sw7q4x') // карточка (OLX listing grid)
-    .each((_, el) => {
-      const a = $(el).find('a[href]').first();
-      const url = a.attr('href');
-      const title = normSpaces($(el).find('h6').first().text()) ||
-                    normSpaces($(el).find('h3').first().text());
-      const priceText = normSpaces($(el).find('p.css-13afqrm').text()) ||
-                        normSpaces($(el).find('p.css-1q7qk2x').text()) ||
-                        normSpaces($(el).find('[data-testid="ad-price"]').text());
-      const price = parsePriceToNumber(priceText);
-      if (!url || !title || !price) return;
+  // Карточка в текущем гриде OLX часто имеет корневой div с классом вида css-1sw7q4x,
+  // заголовок в h6, цена в p[data-testid="ad-price"] или css-13afqrm.
+  $('div.css-1sw7q4x').each((_, el) => {
+    const a = $(el).find('a[href]').first();
+    const url = a.attr('href');
+    const title = normSpaces($(el).find('h6').first().text()) ||
+                  normSpaces($(el).find('h3').first().text());
+    const priceText = normSpaces($(el).find('[data-testid="ad-price"]').first().text()) ||
+                      normSpaces($(el).find('p.css-13afqrm').first().text()) ||
+                      normSpaces($(el).find('p.css-1q7qk2x').first().text());
+    const price = parsePriceToNumber(priceText);
+    if (!url || !title || !price) return;
 
-      // нормализуем URL (иногда приходит относительный)
-      const fullUrl = url.startsWith('http') ? url : `https://www.olx.pl${url}`;
-      // ad_id — возьмем хвост URL без не-алфанумерик
-      const ad_id = (fullUrl.split('/').filter(Boolean).pop() || fullUrl)
-        .replace(/[^0-9a-z\-]/gi, '');
+    const fullUrl = url.startsWith('http') ? url : `https://www.olx.pl${url}`;
+    const ad_id = (fullUrl.split('/').filter(Boolean).pop() || fullUrl)
+      .replace(/[^0-9a-z\-]/gi, '');
 
-      const year = extractYear(title);
-      const { make, model } = splitMakeModel(title);
+    const year = extractYear(title);
+    const { make, model } = splitMakeModel(title);
 
-      items.push({
-        id: ad_id,
-        title,
-        make,
-        model,
-        year,
-        price,
-        url: fullUrl
-      });
-    });
+    items.push({ id: ad_id, title, make, model, year, price, url: fullUrl });
+  });
 
-  // фильтры цены на всякий случай
   return items.filter(it => it.price >= PRICE_MIN && it.price <= PRICE_MAX);
 }
 
-/* OTOMOTO: список объявлений.
-   Селекторы для текущих карточек; если изменятся — обновим. */
+/* OTOMOTO: список объявлений */
 async function parseOtomotoList() {
   const html = await fetchHtml(OTOMOTO_SEARCH_URL);
   const $ = cheerio.load(html);
 
   const items = [];
-  // карточка объявления может иметь разные классы, возьмем <article>
   $('article').each((_, el) => {
     const a = $(el).find('a[href]').first();
     let url = a.attr('href');
@@ -238,7 +238,7 @@ async function parseOtomotoList() {
 
     const title =
       normSpaces($(el).find('h2').first().text()) ||
-      normSpaces($(el).find('a[data-testid="ad-title"]').text());
+      normSpaces($(el).find('a[data-testid="ad-title"]').first().text());
 
     const priceText =
       normSpaces($(el).find('[data-testid="ad-price"]').first().text()) ||
@@ -253,15 +253,7 @@ async function parseOtomotoList() {
     const year = extractYear(title);
     const { make, model } = splitMakeModel(title);
 
-    items.push({
-      id: ad_id,
-      title,
-      make,
-      model,
-      year,
-      price,
-      url
-    });
+    items.push({ id: ad_id, title, make, model, year, price, url });
   });
 
   return items.filter(it => it.price >= PRICE_MIN && it.price <= PRICE_MAX);
@@ -345,7 +337,44 @@ function stopMonitor() {
 }
 
 /* ──────────────────────────────────────────────────────────────
-   6) Routes + Webhook
+   6) Helpers: TOP deals
+   ────────────────────────────────────────────────────────────── */
+// Возвращает TOP N объявлений за X дней, где скидка к средней >= HOT_DISCOUNT_MIN.
+// Скидка = 1 - (price / avg_price). Сортировка по скидке (убывание).
+async function queryTopDeals(limitN = 10, days = TOP_DAYS_DEFAULT) {
+  await initDb();
+  const { rows } = await pool.query(
+    `
+    WITH recent AS (
+      SELECT site, ad_id, title, make, model, year, price::numeric AS price, url, seen_at
+      FROM ads_seen
+      WHERE seen_at >= NOW() - INTERVAL '${days} days'
+        AND price IS NOT NULL
+        AND price BETWEEN $1 AND $2
+    )
+    SELECT r.site, r.ad_id, r.title, r.make, r.model, r.year, r.price, r.url,
+           ms.avg_price::numeric AS avg_price,
+           CASE
+             WHEN ms.avg_price IS NOT NULL AND ms.avg_price > 0
+             THEN (1 - (r.price / ms.avg_price))::numeric
+             ELSE NULL
+           END AS discount
+    FROM recent r
+    LEFT JOIN model_stats ms
+      ON ms.make = r.make AND ms.model = r.model AND (ms.year = r.year OR (ms.year IS NULL AND r.year IS NULL))
+    WHERE ms.avg_price IS NOT NULL
+      AND ms.avg_price > 0
+      AND (1 - (r.price / ms.avg_price)) >= $3
+    ORDER BY discount DESC NULLS LAST, r.seen_at DESC
+    LIMIT $4
+    `,
+    [PRICE_MIN, PRICE_MAX, HOT_DISCOUNT_MIN, limitN]
+  );
+  return rows;
+}
+
+/* ──────────────────────────────────────────────────────────────
+   7) Routes + Webhook
    ────────────────────────────────────────────────────────────── */
 app.get('/', (_req, res) => res.send('lemexicars online 🚗'));
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -388,7 +417,8 @@ app.post('/tg', async (req, res) => {
           '/ping — проверить связь',
           '/watch [минуты] — запустить мониторинг (по умолчанию 15)',
           '/stop — остановить мониторинг',
-          '/status — статус и метрики'
+          '/status — статус и метрики',
+          '/top [N] [days] — топ N лучших предложений за days дней (по умолчанию N=10, days=7)'
         ].join('\n')
       );
       return res.json({ ok: true });
@@ -411,6 +441,7 @@ app.post('/tg', async (req, res) => {
     }
 
     if (/^\/status\b/i.test(text)) {
+      await initDb();
       const { rows: seenCount } = await pool.query('SELECT COUNT(*)::int AS c FROM ads_seen');
       const { rows: statsCount } = await pool.query('SELECT COUNT(*)::int AS c FROM model_stats');
       const info = lastRunInfo;
@@ -422,12 +453,44 @@ app.post('/tg', async (req, res) => {
           `Найдено: ${info.found || 0}, отправлено: ${info.sent || 0}`,
           info.notes?.length ? `Заметки: ${info.notes.join(' | ')}` : '',
           `База: ads_seen=${seenCount[0]?.c || 0}, model_stats=${statsCount[0]?.c || 0}`,
-          `Фильтр: ${PRICE_MIN}–${PRICE_MAX} PLN, порог hot=${Math.round(HOT_THRESHOLD * 100)}%`
+          `Фильтр: ${PRICE_MIN}–${PRICE_MAX} PLN, порог hot=${Math.round(HOT_THRESHOLD * 100)}%`,
+          `TOP: окно ${TOP_DAYS_DEFAULT} дней, мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%`
         ].filter(Boolean).join('\n')
       );
       return res.json({ ok: true });
     }
 
+    if (/^\/top\b/i.test(text)) {
+      await initDb();
+      // парсим аргументы: /top [N] [days]
+      const m = text.match(/\/top(?:\s+(\d+))?(?:\s+(\d+))?/i);
+      const N = m && m[1] ? Math.max(1, Math.min(30, Number(m[1]))) : 10;
+      const days = m && m[2] ? Math.max(1, Math.min(60, Number(m[2]))) : TOP_DAYS_DEFAULT;
+
+      const rows = await queryTopDeals(N, days);
+      if (!rows.length) {
+        await reply(chatId, `За последние ${days} дн. выгодных предложений (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%) не найдено.`);
+        return res.json({ ok: true });
+      }
+
+      let out = `🔝 Топ-${rows.length} предложений за ${days} дн. (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%):\n`;
+      rows.forEach((r, i) => {
+        const avg = Number(r.avg_price);
+        const discount = Number(r.discount || 0);
+        const discountPct = Math.round(discount * 100);
+        out += `\n${i+1}) ${r.site.toUpperCase()}: ${r.title}\n`;
+        out += `Цена: ${Math.round(Number(r.price))} PLN • Средняя: ${Math.round(avg)} PLN • Скидка: -${discountPct}%\n`;
+        out += `${r.url}\n`;
+      });
+
+      // делим длинные сообщения на части
+      for (const chunk of chunkMessages(out)) {
+        await reply(chatId, chunk);
+      }
+      return res.json({ ok: true });
+    }
+
+    // по умолчанию не отвечаем, чтобы не шуметь
     return res.json({ ok: true });
   } catch (e) {
     console.error('Webhook error:', e);
@@ -436,7 +499,7 @@ app.post('/tg', async (req, res) => {
 });
 
 /* ──────────────────────────────────────────────────────────────
-   7) Start
+   8) Start
    ────────────────────────────────────────────────────────────── */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('lemexicars up on', PORT));
