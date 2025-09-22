@@ -30,7 +30,6 @@ export function extractPriceNumber(it) {
 }
 
 export function getPublishedAt(it) {
-  // ищем поле даты в разных вариантах
   return (
     it.publishedAt || it.published_at || it.createdAt || it.created_at ||
     it.date || it.time || it.postedAt || it.posted_at || null
@@ -38,8 +37,9 @@ export function getPublishedAt(it) {
 }
 
 export function isFreshWithinDays(it, days = 7) {
+  if (!days || days <= 0) return true; // без ограничения по свежести
   const iso = getPublishedAt(it);
-  if (!iso) return true; // если не знаем — не режем (чтобы не терять новинки)
+  if (!iso) return true;
   const t = Date.parse(iso);
   if (isNaN(t)) return true;
   const ageMs = Date.now() - t;
@@ -51,7 +51,7 @@ export function filterFreshAndPrice(items, { priceMin, priceMax, freshDays }) {
   return items.filter(it => {
     if (!isFreshWithinDays(it, freshDays)) return false;
     const p = extractPriceNumber(it);
-    if (p == null) return true; // без цены — пропускаем фильтр, но можно ужесточить
+    if (p == null) return true; // без цены — пропускаем, чтобы не потерять потенциальные TOP
     return p >= priceMin && p <= priceMax;
   });
 }
@@ -71,7 +71,7 @@ export function fmtItem(it, badge = '') {
   return `${b}<b>${escapeHtml(title)}</b>\n${escapeHtml(price)} • ${escapeHtml(loc)}\n${url}`;
 }
 
-// Группировка для TOP: brand + первая модельное слово
+// Группировка для TOP: бренд + 1–2 слова модели
 export function modelKeyFromTitle(title = '') {
   const t = title.toLowerCase()
     .replace(/[^\p{L}\p{N}\s\-]+/gu, ' ')
@@ -79,7 +79,6 @@ export function modelKeyFromTitle(title = '') {
     .trim();
   const parts = t.split(' ');
   if (parts.length === 0) return t;
-  // бренд + 1–2 токена модели
   const brand = parts[0];
   const model = (parts[1] || '') + ' ' + (parts[2] || '');
   return (brand + ' ' + model).trim();
