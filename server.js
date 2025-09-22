@@ -82,7 +82,6 @@ async function markSeen(site, ad) {
     [site, ad.id, ad.title, ad.make, ad.model, ad.year, ad.price, ad.url]
   );
 }
-
 async function updateStats(ad) {
   const { make, model, year, price } = ad;
   if (!make || !model || !year || !price) {
@@ -179,7 +178,6 @@ function splitMakeModel(title = '') {
     model: model ? model.toUpperCase() : 'UNKNOWN'
   };
 }
-
 async function fetchHtml(url) {
   const r = await fetch(url, {
     headers: {
@@ -192,14 +190,12 @@ async function fetchHtml(url) {
   return await r.text();
 }
 
-/* OLX: список объявлений */
+/* OLX */
 async function parseOlxList() {
   const html = await fetchHtml(OLX_SEARCH_URL);
   const $ = cheerio.load(html);
 
   const items = [];
-  // Карточка в текущем гриде OLX часто имеет корневой div с классом вида css-1sw7q4x,
-  // заголовок в h6, цена в p[data-testid="ad-price"] или css-13afqrm.
   $('div.css-1sw7q4x').each((_, el) => {
     const a = $(el).find('a[href]').first();
     const url = a.attr('href');
@@ -224,7 +220,7 @@ async function parseOlxList() {
   return items.filter(it => it.price >= PRICE_MIN && it.price <= PRICE_MAX);
 }
 
-/* OTOMOTO: список объявлений */
+/* OTOMOTO */
 async function parseOtomotoList() {
   const html = await fetchHtml(OTOMOTO_SEARCH_URL);
   const $ = cheerio.load(html);
@@ -339,8 +335,6 @@ function stopMonitor() {
 /* ──────────────────────────────────────────────────────────────
    6) Helpers: TOP deals
    ────────────────────────────────────────────────────────────── */
-// Возвращает TOP N объявлений за X дней, где скидка к средней >= HOT_DISCOUNT_MIN.
-// Скидка = 1 - (price / avg_price). Сортировка по скидке (убывание).
 async function queryTopDeals(limitN = 10, days = TOP_DAYS_DEFAULT) {
   await initDb();
   const { rows } = await pool.query(
@@ -462,7 +456,6 @@ app.post('/tg', async (req, res) => {
 
     if (/^\/top\b/i.test(text)) {
       await initDb();
-      // парсим аргументы: /top [N] [days]
       const m = text.match(/\/top(?:\s+(\d+))?(?:\s+(\d+))?/i);
       const N = m && m[1] ? Math.max(1, Math.min(30, Number(m[1]))) : 10;
       const days = m && m[2] ? Math.max(1, Math.min(60, Number(m[2]))) : TOP_DAYS_DEFAULT;
@@ -483,14 +476,12 @@ app.post('/tg', async (req, res) => {
         out += `${r.url}\n`;
       });
 
-      // делим длинные сообщения на части
       for (const chunk of chunkMessages(out)) {
         await reply(chatId, chunk);
       }
       return res.json({ ok: true });
     }
 
-    // по умолчанию не отвечаем, чтобы не шуметь
     return res.json({ ok: true });
   } catch (e) {
     console.error('Webhook error:', e);
