@@ -2,11 +2,10 @@ import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import fetch from 'node-fetch';
-import fs from 'fs';
 import puppeteer from 'puppeteer-core';
 import { Pool } from 'pg';
 
-/* ================= ENV ================= */
+/* ============== ENV ============== */
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ALLOWED = (process.env.ALLOWED_CHAT_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -16,12 +15,12 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
-const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 0.85); // 85% от средней
-
+const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 0.85);        // 85% от средней
+const HOT_DISCOUNT_MIN = Number(process.env.HOT_DISCOUNT_MIN || 0.20);  // для /top
 const TOP_DAYS_DEFAULT = Number(process.env.TOP_DAYS_DEFAULT || 7);
-const HOT_DISCOUNT_MIN = Number(process.env.HOT_DISCOUNT_MIN || 0.20); // для /top
 const PAGES = Number(process.env.PAGES || 3);
 
+// эти URL можно переопределить через переменные окружения
 const OLX_SEARCH_URL =
   process.env.OLX_SEARCH_URL ||
   'https://www.olx.pl/d/motoryzacja/samochody/wroclaw/?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
@@ -30,12 +29,15 @@ const OTOMOTO_SEARCH_URL =
   process.env.OTOMOTO_SEARCH_URL ||
   'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
 
-/* ================ APP ================ */
+// главное: путь к браузеру кладём в .env / Dockerfile
+const EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH; // напр. /usr/bin/google-chrome
+
+/* ============== APP ============== */
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-/* ================ DB (Neon) ================ */
+/* ============== DB (Neon/Postgres) ============== */
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function initDb() {
@@ -64,7 +66,6 @@ async function initDb() {
     );
   `);
 }
-
 async function alreadySeen(site, adId) {
   if (!site || !adId) return true;
   const { rows } = await pool.query(
@@ -108,7 +109,7 @@ async function updateStats(ad) {
   }
 }
 
-/* ================ Telegram ================ */
+/* ============== Telegram helpers ============== */
 async function tg(method, payload) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const r = await fetch(url, {
@@ -124,40 +125,24 @@ function isAllowed(chatId) { return CHAT_ALLOWED.includes(String(chatId)); }
 async function reply(chatId, text) {
   return tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: false });
 }
-async function notify(text) { if (!TELEGRAM_CHAT_ID) return; return reply(TELEGRAM_CHAT_ID, text); }
+async function notify(text) { if (TELEGRAM_CHAT_ID) return reply(TELEGRAM_CHAT_ID, text); }
 function chunk(str, n=3500){ const a=[]; let s=String(str); while(s.length>n){let i=s.lastIndexOf('\n',n); if(i<0)i=n; a.push(s.slice(0,i)); s=s.slice(i);} if(s)a.push(s); return a; }
 
-/* ================ Utils ================ */
-function norm(s=''){ return String(s||'').replace(/\s+/g,' ').trim(); }
-function priceNum(s=''){ const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; }
-function yearFrom(title=''){ const m=String(title).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; }
+/* ============== Utils ============== */
+const norm = s => String(s||'').replace(/\s+/g,' ').trim();
+const priceNum = s => { const n=Number(String(s).replace(/[^\d]/g,'')); return Number.isFinite(n)?n:null; };
+const yearFrom = t => { const m=String(t).match(/\b(19\d{2}|20\d{2})\b/); return m?Number(m[1]):null; };
 function splitMM(title=''){ const p=norm(title).split(' ').filter(Boolean); return { make:p[0]||'Unknown', model:p.slice(1,3).join(' ')||'UNKNOWN' }; }
-function withPage(url,p){ return p<=1?url : url + (url.includes('?')?`&page=${p}`:`?page=${p}`); }
+const withPage = (url,p)=> p<=1?url : url+(url.includes('?')?`&page=${p}`:`?page=${p}`);
 
-/* ============== Puppeteer (обязательный executablePath) ============== */
-function resolveExecPath() {
-  const env = process.env.PUPPETEER_EXECUTABLE_PATH;
-  const candidates = [
-    env,
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser'
-  ].filter(Boolean);
-  for (const p of candidates) {
-    try { if (fs.existsSync(p)) return p; } catch {}
-  }
-  // Последний шанс: всё равно вернём дефолт для puppeteer-core (иначе он падает с "must be specified")
-  return '/usr/bin/google-chrome';
-}
-const EXEC_PATH = resolveExecPath();
-
+/* ============== Puppeteer (обязательно указываем путь) ============== */
 let browser = null;
 async function getHtml(url){
+  if (!EXECUTABLE_PATH) throw new Error('PUPPETEER_EXECUTABLE_PATH is not set');
   if (!browser) {
     browser = await puppeteer.launch({
       headless: 'new',
-      executablePath: EXEC_PATH,                   // <- всегда указан
+      executablePath: EXECUTABLE_PATH,
       args: ['--no-sandbox','--disable-dev-shm-usage','--single-process']
     });
   }
@@ -175,8 +160,9 @@ async function getHtml(url){
   return html;
 }
 
-/* ============== Parsers (regex по html) ============== */
+/* ============== Scrapers (regex по html) ============== */
 async function parseHtml(html, site){
+  // выдергиваем url, title, price из карточек для OLX/OTOMOTO
   const re = /<a[^>]*href="([^"]+)"[^>]*>(?:.*?)<\/a>.*?(?:<h2[^>]*>|<h3[^>]*>|<h6[^>]*|data-testid="ad-title")[^>]*>(.*?)<\/(?:h2|h3|h6|a)>.*?(?:data-testid="ad-price"[^>]*>|\bclass="[^"]*(?:ooa-1bmnxg7|css-13afqrm|css-1q7qk2x)[^"]*")[^>]*>(.*?)</gis;
   const items=[]; let m;
   while ((m = re.exec(html)) !== null) {
@@ -194,16 +180,15 @@ async function parseHtml(html, site){
 }
 
 async function parseSite(baseUrl, site){
-  const all=[]; for (let p=1; p<=PAGES; p++){
+  const out=[]; for (let p=1; p<=PAGES; p++){
     const html = await getHtml(withPage(baseUrl,p));
-    const chunk = await parseHtml(html, site);
-    all.push(...chunk);
-  } return all;
+    out.push(...await parseHtml(html, site));
+  } return out;
 }
 const parseOlxList = () => parseSite(OLX_SEARCH_URL, 'OLX');
 const parseOtomotoList = () => parseSite(OTOMOTO_SEARCH_URL, 'OTOMOTO');
 
-/* ============== Monitor ============== */
+/* ============== Monitor loop ============== */
 let timer=null;
 let lastRunInfo = { ts:null, found:0, sent:0, notes:[] };
 
@@ -244,11 +229,10 @@ async function monitorOnce(){
   lastRunInfo = { ts: new Date().toISOString(), found, sent, notes };
   return lastRunInfo;
 }
-
 function startMonitor(mins=15){ if (timer) clearInterval(timer); timer=setInterval(monitorOnce, Math.max(1,mins)*60*1000); }
 function stopMonitor(){ if (timer) clearInterval(timer); timer=null; }
 
-/* ============== /top (фикс $1::interval) ============== */
+/* ============== /top из базы ============== */
 async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
   await initDb();
   const sql = `
@@ -310,8 +294,8 @@ app.post('/tg', async (req,res)=>{
         '/watch [мин] — запустить мониторинг (по умолчанию 15)',
         '/stop — остановить мониторинг',
         '/status — статус и метрики',
-        `/top [N] [days] — топ N скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%) за days дней`,
-        '/scan — разовый обход источников'
+        `/scan — разовый обход источников`,
+        `/top [N] [days] — топ скидок (≥${Math.round(HOT_DISCOUNT_MIN*100)}%)`
       ].join('\n'));
 
     } else if (/^\/watch\b/i.test(text)) {
@@ -352,7 +336,6 @@ app.post('/tg', async (req,res)=>{
       const N=m&&m[1]?Math.max(1,Math.min(30,Number(m[1]))):10;
       const days=m&&m[2]?Math.max(1,Math.min(90,Number(m[2]))):TOP_DAYS_DEFAULT;
 
-      // если за окно данных нет — сделаем разовый обход
       const { rows: cntRows } = await pool.query(
         'SELECT COUNT(*)::int AS c FROM ads_seen WHERE seen_at >= NOW() - $1::interval',
         [`${days} days`]
@@ -384,6 +367,6 @@ app.post('/tg', async (req,res)=>{
   }
 });
 
-/* ================ Start ================ */
+/* ============== Start ============== */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('lemexicars up on', PORT));
