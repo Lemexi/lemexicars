@@ -1,6 +1,6 @@
 FROM node:20-bullseye
 
-# Системные библиотеки для Chromium/Chrome
+# Библиотеки для запуска headless Chrome
 RUN apt-get update && \
     apt-get install -y \
       ca-certificates \
@@ -10,15 +10,20 @@ RUN apt-get update && \
       libxext6 libxi6 libxtst6 libdrm2 libgbm1 libcups2 \
       libgtk-3-0 libdbus-1-3 libatspi2.0-0 libxshmfence1 \
       libx11-6 libxcb1 libnspr4 libpango-1.0-0 libpangocairo-1.0-0 \
-      --no-install-recommends && \
+      wget gnupg --no-install-recommends && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production
+# говорим Puppeteer не скипать загрузку
+ENV PUPPETEER_SKIP_DOWNLOAD=false
+# куда ставить кеш
+ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
 
 WORKDIR /app
 COPY package*.json ./
-# Puppeteer при установке сам скачает подходящий Chromium
-RUN npm ci --omit=dev
+
+# Здесь Puppeteer скачает Chromium
+RUN npm ci --omit=dev && npx puppeteer browsers install chrome
 
 COPY . .
 EXPOSE 8080
