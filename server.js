@@ -1,9 +1,9 @@
-// server.js — Lemexi Cars (финальная версия с Puppeteer + Postgres + Telegram)
+// server.js — Lemexi Cars (Render Node service, Puppeteer + Postgres + Telegram)
 import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import fetch from 'node-fetch';
-import puppeteer from 'puppeteer';
+import puppeteer, { executablePath } from 'puppeteer';
 import { Pool } from 'pg';
 
 /* ===================== ENV ===================== */
@@ -21,10 +21,10 @@ const HOT_DISCOUNT_MIN  = Number(process.env.HOT_DISCOUNT_MIN || 0.20);
 const TOP_DAYS_DEFAULT  = Number(process.env.TOP_DAYS_DEFAULT || 7);
 const PAGES = Number(process.env.PAGES || 3);
 
+// поисковые URL
 const OLX_SEARCH_URL =
   process.env.OLX_SEARCH_URL ||
   'https://www.olx.pl/d/motoryzacja/samochody/wroclaw/?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
-
 const OTOMOTO_SEARCH_URL =
   process.env.OTOMOTO_SEARCH_URL ||
   'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
@@ -139,8 +139,16 @@ let browser = null;
 
 async function launchBrowser() {
   if (browser) return browser;
+
+  // 1) берём путь из ENV (если ты захочешь зафиксировать версию вручную)
+  // 2) иначе — из встроенной функции Puppeteer (ищет в кэше Render)
+  const execPath =
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    (await executablePath());
+
   browser = await puppeteer.launch({
     headless: 'new',
+    executablePath: execPath,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -159,10 +167,13 @@ async function getHtml(url){
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
   await page.setExtraHTTPHeaders({ 'Accept-Language':'pl-PL,pl;q=0.9,en;q=0.8' });
   await page.setViewport({ width: 1366, height: 900 });
+
+  // экономим трафик
   await page.setRequestInterception(true);
   page.on('request', req => ['image','media','font'].includes(req.resourceType()) ? req.abort() : req.continue());
-  await page.goto(url, { waitUntil:'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(600);
+
+  await page.goto(url, { waitUntil:'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(700);
   const html = await page.content();
   await page.close();
   return html;
@@ -176,7 +187,9 @@ async function parseHtml(html, site){
     let url = m[1]; const title = norm(m[2].replace(/<[^>]+>/g,''));
     const price = priceN(m[3]);
     if (!url || !title || !price) continue;
+
     if (!/^https?:\/\//i.test(url)) url = (site==='OLX' ? 'https://www.olx.pl' : 'https://www.otomoto.pl') + url;
+
     const year = yearOf(title); const { make, model } = splitMM(title);
     items.push({
       id: (url.split('/').filter(Boolean).pop()||url).replace(/[^0-9a-z\-]/gi,''),
@@ -186,10 +199,13 @@ async function parseHtml(html, site){
   return items.filter(i => i.price>=PRICE_MIN && i.price<=PRICE_MAX);
 }
 async function parseSite(baseUrl, site){
-  const out=[]; for (let p=1; p<=PAGES; p++){
+  const out=[];
+  for (let p=1; p<=PAGES; p++){
     const html = await getHtml(withPage(baseUrl,p));
     out.push(...await parseHtml(html, site));
-  } return out;
+    await new Promise(r => setTimeout(r, 300 + Math.random()*500));
+  }
+  return out;
 }
 const parseOlxList     = () => parseSite(OLX_SEARCH_URL, 'OLX');
 const parseOtomotoList = () => parseSite(OTOMOTO_SEARCH_URL, 'OTOMOTO');
@@ -210,10 +226,12 @@ async function monitorOnce(){
         if (await alreadySeen(s.name.toLowerCase(), ad.id)) continue;
         await markSeen(s.name.toLowerCase(), ad);
         const st = await updateStats(ad);
+
         let hot=false;
         if (st.old_avg !== null && Number(st.old_avg) > 0) {
           hot = Number(ad.price) <= Number(st.old_avg) * HOT_THRESHOLD;
         }
+
         let text = (hot ? '🔥 ГОРЯЧЕЕ ПРЕДЛОЖЕНИЕ!\n' : '') +
           `${s.name}: ${ad.title}\nЦена: ${ad.price} PLN\nМарка: ${ad.make}\nМодель: ${ad.model}\nГод: ${ad.year || '—'}\n${ad.url}\n`;
         if (st.new_count) {
@@ -229,6 +247,7 @@ async function monitorOnce(){
       notes.push(`${s.name} error: ${e.message}`); console.error(`${s.name} error`, e);
     }
   }
+
   lastRunInfo = { ts: new Date().toISOString(), found, sent, notes };
   return lastRunInfo;
 }
@@ -276,6 +295,7 @@ async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
 app.get('/', (_req,res)=>res.send('lemexicars online 🚗'));
 app.get('/health', (_req,res)=>res.json({ ok:true }));
 
+// Диагностика браузера
 app.get('/chrome', async (_req, res) => {
   try {
     const b = await launchBrowser();
@@ -291,39 +311,77 @@ app.post('/tg', async (req,res)=>{
     const update=req.body;
     const msg=update.message || update.edited_message || update.channel_post;
     if (!msg) return res.json({ ok:true });
+
     const chatId = msg.chat?.id;
     const text = (msg.text || '').trim();
+
     if (!isAllowed(chatId)) { await reply(chatId,'У вас нет прав'); return res.json({ ok:true }); }
 
     if (/^\/ping\b/i.test(text)) {
       await reply(chatId,'pong ✅');
+
     } else if (/^\/watch\b/i.test(text)) {
       const m=text.match(/\/watch\s+(\d+)/i); const every=m?Number(m[1]):15;
-      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин.`);
+      await reply(chatId,`⏱ Запускаю мониторинг каждые ${every} мин. (страниц/источник: ${PAGES})`);
       startMonitor(every); monitorOnce().catch(e=>console.error('first run',e));
+
     } else if (/^\/stop\b/i.test(text)) {
       stopMonitor(); await reply(chatId,'⏹ Мониторинг остановлен.');
+
     } else if (/^\/status\b/i.test(text)) {
       await initDb();
       const { rows: seenCount } = await pool.query('SELECT COUNT(*)::int AS c FROM ads_seen');
-      await reply(chatId,`Статус: ${timer?'🟢':'🔴'}, база: ${seenCount[0]?.c||0} объявлений`);
+      const { rows: statsCount } = await pool.query('SELECT COUNT(*)::int AS c FROM model_stats');
+      const i=lastRunInfo;
+      await reply(chatId,[
+        `Статус: ${timer?'🟢 запущен':'🔴 остановлен'}`,
+        `Последний прогон: ${i.ts || '—'}`,
+        `Найдено: ${i.found||0}, отправлено: ${i.sent||0}`,
+        i.notes?.length ? `Заметки: ${i.notes.join(' | ')}` : '',
+        `База: ads_seen=${seenCount[0]?.c||0}, model_stats=${statsCount[0]?.c||0}`,
+        `Фильтр: ${PRICE_MIN}–${PRICE_MAX} PLN, hot=${Math.round(HOT_THRESHOLD*100)}%`,
+        `TOP: окно ${TOP_DAYS_DEFAULT} дн., мин. скидка ${Math.round(HOT_DISCOUNT_MIN*100)}%, страниц=${PAGES}`
+      ].filter(Boolean).join('\n'));
+
     } else if (/^\/scan\b/i.test(text)) {
-      await reply(chatId, '🔎 Делаю разовый обход...');
-      const info = await monitorOnce();
-      await reply(chatId, `Готово. Найдено: ${info.found}, отправлено: ${info.sent}`);
+      await reply(chatId, '🔎 Делаю разовый обход источников…');
+      try {
+        const info = await monitorOnce();
+        await reply(chatId, `Готово. Найдено: ${info.found}, отправлено: ${info.sent}. Теперь можно смотреть /top.`);
+      } catch (e) {
+        await reply(chatId, `Ошибка сканирования: ${e.message}`);
+      }
+
     } else if (/^\/top\b/i.test(text)) {
-      const rows = await queryTopDeals(10, TOP_DAYS_DEFAULT);
+      await initDb();
+      const m=text.match(/\/top(?:\s+(\d+))?(?:\s+(\d+))?/i);
+      const N=m&&m[1]?Math.max(1,Math.min(30,Number(m[1]))):10;
+      const days=m&&m[2]?Math.max(1,Math.min(90,Number(m[2]))):TOP_DAYS_DEFAULT;
+
+      const { rows: cntRows } = await pool.query(
+        'SELECT COUNT(*)::int AS c FROM ads_seen WHERE seen_at >= NOW() - $1::interval',
+        [`${days} days`]
+      );
+      if ((cntRows[0]?.c || 0) === 0) {
+        await reply(chatId, '🗃️ База пуста за выбранный период — делаю разовый обход...');
+        await monitorOnce().catch(e => console.error('scan for top', e));
+      }
+
+      const rows = await queryTopDeals(N, days);
       if (!rows.length) {
-        await reply(chatId, 'Выгодных предложений не найдено.');
+        await reply(chatId, `За последние ${days} дн. выгодных предложений (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%) не найдено.`);
       } else {
-        let out = `🔝 Топ-${rows.length} предложений:\n`;
+        let out=`🔝 Топ-${rows.length} предложений за ${days} дн. (скидка ≥ ${Math.round(HOT_DISCOUNT_MIN*100)}%):\n`;
         rows.forEach((r,i)=>{
           const avg=Number(r.avg_price); const dPct=Math.round(Number(r.discount||0)*100);
-          out+=`\n${i+1}) ${r.site}: ${r.title}\nЦена: ${Math.round(r.price)} PLN • Средняя: ${Math.round(avg)} PLN • Скидка: -${dPct}%\n${r.url}\n`;
+          out+=`\n${i+1}) ${String(r.site).toUpperCase()}: ${r.title}\n`;
+          out+=`Цена: ${Math.round(Number(r.price))} PLN • Средняя: ${Math.round(avg)} PLN • Скидка: -${dPct}%\n`;
+          out+=`${r.url}\n`;
         });
         for (const c of chunk(out)) await reply(chatId,c);
       }
     }
+
     return res.json({ ok:true });
   }catch(e){
     console.error('Webhook error:', e);
@@ -331,7 +389,7 @@ app.post('/tg', async (req,res)=>{
   }
 });
 
-/* ===================== Start ===================== */
+/* ===================== Start & graceful shutdown ===================== */
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log('lemexicars up on', PORT));
 
