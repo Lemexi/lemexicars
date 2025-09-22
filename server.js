@@ -1,9 +1,9 @@
-// server.js — Lemexi Cars
+// server.js — Lemexi Cars (вариант A: puppeteer с встроенным Chromium)
 import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import fetch from 'node-fetch';
-import puppeteer from 'puppeteer-core';
+import puppeteer from 'puppeteer';
 import { Pool } from 'pg';
 
 /* ===================== ENV ===================== */
@@ -35,9 +35,6 @@ const OLX_SEARCH_URL =
 const OTOMOTO_SEARCH_URL =
   process.env.OTOMOTO_SEARCH_URL ||
   'https://www.otomoto.pl/osobowe/wroclaw?search%5Bdist%5D=100&search%5Bfilter_float_price%3Afrom%5D=1000&search%5Bfilter_float_price%3Ato%5D=22000';
-
-// путь до системного Chromium (задаёт Dockerfile); дадим дефолт
-const EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
 
 /* ===================== APP ===================== */
 const app = express();
@@ -144,26 +141,28 @@ function splitMM(title=''){
 }
 const withPage = (url,p)=> p<=1?url : url+(url.includes('?')?`&page=${p}`:`?page=${p}`);
 
-/* ===================== Puppeteer-core ===================== */
+/* ===================== Puppeteer ===================== */
 let browser = null;
 
-async function getHtml(url){
-  // здесь больше не падаем при пустой переменной — есть дефолт из Dockerfile
-  const executablePath = EXECUTABLE_PATH || '/usr/bin/chromium';
+async function launchBrowser() {
+  if (browser) return browser;
+  browser = await puppeteer.launch({
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--single-process',
+      '--no-zygote',
+      '--disable-gpu'
+    ]
+  });
+  return browser;
+}
 
-  if (!browser) {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--single-process'
-      ]
-    });
-  }
-  const page = await browser.newPage();
+async function getHtml(url){
+  const b = await launchBrowser();
+  const page = await b.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
   await page.setExtraHTTPHeaders({ 'Accept-Language':'pl-PL,pl;q=0.9,en;q=0.8' });
   await page.setViewport({ width: 1366, height: 900 });
@@ -293,6 +292,17 @@ async function queryTopDeals(N=10, days=TOP_DAYS_DEFAULT){
 app.get('/', (_req,res)=>res.send('lemexicars online 🚗'));
 app.get('/health', (_req,res)=>res.json({ ok:true }));
 
+// диагностика браузера
+app.get('/chrome', async (_req, res) => {
+  try {
+    const b = await launchBrowser();
+    const ver = await b.version();
+    res.json({ ok:true, version: ver, exec: 'bundled' });
+  } catch (e) {
+    res.json({ ok:false, error: e.message });
+  }
+});
+
 // опционально: быстрый сет вебхука (если нужно переустановить)
 app.get('/set-webhook', async (_req, res) => {
   if (!process.env.PUBLIC_URL) {
@@ -397,6 +407,14 @@ app.post('/tg', async (req,res)=>{
   }
 });
 
-/* ===================== Start ===================== */
+/* ===================== Start & graceful shutdown ===================== */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('lemexicars up on', PORT));
+const server = app.listen(PORT, () => console.log('lemexicars up on', PORT));
+
+async function shutdown() {
+  try { if (browser) await browser.close(); } catch {}
+  try { if (pool) await pool.end(); } catch {}
+  try { server.close(()=>process.exit(0)); } catch { process.exit(0); }
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
