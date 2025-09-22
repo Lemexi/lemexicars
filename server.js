@@ -175,10 +175,12 @@ async function getHtmlSmart(url) {
     }
   } catch (_) {}
 
-  // 2) Puppeteer
+  // 2) Puppeteer (используем executablePath из установленного Chromium)
   if (!browser) {
+    const exePath = process.env.PUPPETEER_EXECUTABLE_PATH || (await puppeteer.executablePath());
     browser = await puppeteer.launch({
       headless: 'new',
+      executablePath: exePath,
       args: ['--no-sandbox', '--disable-dev-shm-usage']
     });
   }
