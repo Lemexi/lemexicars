@@ -1,234 +1,372 @@
-// scraper.js — нормализация, группировка моделей, фильтры и форматирование
-// v1.2
+// server.js — Telegram + SQLite + Apify + /scrape + /top + /stop
+// v1.3
 
-/* ───────────── Общие утилиты ───────────── */
-export function parseStartUrls(envStr) {
-  return (envStr || '')
-    .split('\n')
-    .map(s => s.trim())
-    .filter(Boolean);
+import 'dotenv/config';
+import express from 'express';
+import morgan from 'morgan';
+import fetch from 'node-fetch';
+
+import { runScrape as apifyRunWatch, runBrandUpdate } from './apify.js';
+import { hasSeen, markSeen } from './db.js';
+import {
+  parseStartUrls, adHash, filterFreshAndPrice, fmtItem,
+  extractPriceNumber, getPublishedAt, groupKeyFromItem
+} from './scraper.js';
+import {
+  checkBelowMarket, fmtBelowMarketInfo, updateMarket
+} from './top.js';
+
+/* ───────────── ENV ───────────── */
+const PORT = process.env.PORT || 8080;
+
+// Telegram
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
+const TG_WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET || 'olxhook';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+// Поиск/радиус
+const START_URLS = parseStartUrls(process.env.START_URLS);
+
+// Базовые фильтры
+const PRICE_MIN = Number(process.env.PRICE_MIN || 1000);
+const PRICE_MAX = Number(process.env.PRICE_MAX || 22000);
+
+// Свежесть
+const FRESH_DAYS_DEFAULT = Number(process.env.FRESH_DAYS || 7);
+const NEW_MAX_AGE_MIN = Number(process.env.NEW_MAX_AGE_MIN || 15);
+const TOP_MAX_AGE_HOURS = Number(process.env.TOP_MAX_AGE_HOURS || 48);
+
+// Объёмы выборок
+const WATCH_MAX_ITEMS = Number(process.env.WATCH_MAX_ITEMS || 40);
+const MARKET_MAX_ITEMS = Number(process.env.MARKET_MAX_ITEMS || 150);
+
+// Кэш рынка и автопоиск
+const MARKET_REFRESH_MIN = Number(process.env.MARKET_REFRESH_MIN || 120);
+let cronTimer = null;
+let cronEnabled = (process.env.ENABLE_CRON || 'true').toLowerCase() === 'true';
+const CRON_EVERY_MIN = Number(process.env.CRON_EVERY_MIN || 15);
+
+/* ───────────── App ───────────── */
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('dev'));
+
+function allowChat(chatId) {
+  if (!ALLOWED_CHAT_IDS.length) return true;
+  return ALLOWED_CHAT_IDS.includes(String(chatId));
 }
 
-export function normalizeUrl(u = '') {
-  try {
-    const url = new URL(u);
-    url.hash = '';
-    return url.origin + url.pathname; // без query для стабильного hash
-  } catch {
-    return (u || '').split('#')[0].split('?')[0];
+async function tgSend(chatId, text, opts = {}) {
+  if (!BOT_TOKEN) {
+    console.error('tgSend: BOT_TOKEN not set');
+    return { ok: false, error: 'BOT_TOKEN not set' };
   }
-}
-
-export function adHash(item) {
-  const u = item.url || item.link || item.detailUrl || '';
-  return normalizeUrl(u);
-}
-
-export function escapeHtml(s = '') {
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-/* ───────────── Данные объявления ───────────── */
-export function getLocationText(it = {}) {
-  const loc = it.location || it.city || it.region || it.area || {};
-  if (typeof loc === 'string') return loc;
-  const parts = [];
-  if (loc.city) parts.push(loc.city);
-  if (loc.region) parts.push(loc.region);
-  if (loc.district) parts.push(loc.district);
-  if (loc.name) parts.push(loc.name);
-  return parts.filter(Boolean).join(', ');
-}
-
-export function extractPriceNumber(it = {}) {
-  const raw = it.price || it.priceText || it.price_text || '';
-  const m = String(raw).replace(/\s/g, '').match(/(\d[\d.,]*)/);
-  if (!m) return null;
-  return Number(m[1].replace(/\./g, '').replace(/,/g, '.'));
-}
-
-export function getPublishedAt(it = {}) {
-  return (
-    it.publishedAt || it.published_at ||
-    it.createdAt || it.created_at ||
-    it.date || it.time || it.postedAt || it.posted_at || null
-  );
-}
-
-/* ───────────── Свежеcть ───────────── */
-export function isFreshWithinDays(it, days = 7) {
-  if (!days || days <= 0) return true; // без ограничения
-  const iso = getPublishedAt(it);
-  if (!iso) return false; // для watch лучше требовать явную дату
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return false;
-  const ageMs = Date.now() - t;
-  return ageMs <= days * 24 * 3600 * 1000;
-}
-
-export function isFreshWithinMinutes(it, minutes = 15) {
-  if (!minutes || minutes <= 0) return true;
-  const iso = getPublishedAt(it);
-  if (!iso) return false;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return false;
-  const ageMs = Date.now() - t;
-  return ageMs <= minutes * 60 * 1000;
-}
-
-/**
- * Универсальный фильтр по свежести и цене.
- * freshDays: число дней или null/0 (без ограничения)
- * freshMinutes: число минут или null/0 (без ограничения)
- */
-export function filterFreshAndPrice(items, { priceMin, priceMax, freshDays = null, freshMinutes = null }) {
-  return (items || []).filter(it => {
-    if (freshMinutes != null && freshMinutes > 0 && !isFreshWithinMinutes(it, freshMinutes)) return false;
-    if (freshDays != null && freshDays > 0 && !isFreshWithinDays(it, freshDays)) return false;
-    const p = extractPriceNumber(it);
-    if (p == null) return false; // для нашей задачи без цены — бессмысленно
-    if (priceMin != null && p < priceMin) return false;
-    if (priceMax != null && p > priceMax) return false;
-    return true;
+  const url = `${TELEGRAM_API}/sendMessage`;
+  const body = {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: false,
+    ...opts,
+  };
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
+  const j = await r.json();
+  if (!j.ok) console.error('Telegram sendMessage failed:', j);
+  return j;
 }
 
-/* ───────────── Нормализация модели ───────────── */
-const BRAND_ALIASES = {
-  'vw': 'volkswagen',
-  'merc': 'mercedes',
-  'mercedes-benz': 'mercedes',
-  'bмw': 'bmw', // опечатки/кириллица
-};
-
-const FUEL_WORDS = {
-  diesel: ['diesel', 'dci', 'tdi', 'cdti', 'd', 'd-4d', 'hdi', 'multijet', 'dci'],
-  petrol: ['benzyna', 'benzin', 'pb', 'lpg', 'mpi', 'fsi', 'tsi', 'tce', 'essence', 'gasoline'],
-  hybrid: ['hybrid', 'hybryda', 'phev'],
-  electric: ['ev', 'electric', 'elektryczny', 'elektryk', 'ze']
-};
-
-const YEAR_RX = /\b(19|20)\d{2}\b/;
-const KM_RX = /\b(\d{1,3}(?:[ .]?\d{3})+|\d{4,6})\s*(?:km|tys\.?|tys|k)\b/i;
-
-export function detectFuel(str = '') {
-  const t = str.toLowerCase();
-  const has = (arr) => arr.some(w => t.includes(w));
-  if (has(FUEL_WORDS.electric)) return 'electric';
-  if (has(FUEL_WORDS.hybrid))  return 'hybrid';
-  if (has(FUEL_WORDS.diesel))  return 'diesel';
-  if (has(FUEL_WORDS.petrol))  return 'petrol';
-  return '';
+/* ───────────── Helpers ───────────── */
+function ageHours(it) {
+  const iso = getPublishedAt(it);
+  if (!iso) return Infinity;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return Infinity;
+  return (Date.now() - t) / 3_600_000;
 }
 
-export function extractYear(str = '') {
-  const m = String(str).match(YEAR_RX);
-  if (!m) return null;
-  const y = Number(m[0]);
-  if (y < 1980 || y > new Date().getFullYear() + 1) return null;
-  return y;
+function splitNewAndEligible(items) {
+  // Возвращает:
+  //  - newOnes: новые по минутам
+  //  - eligible: подходящие по базовым фильтрам (дальше проверяем "ниже рынка")
+  const base = filterFreshAndPrice(items, {
+    priceMin: PRICE_MIN,
+    priceMax: PRICE_MAX,
+    freshDays: FRESH_DAYS_DEFAULT,     // защитный максимум по возрасту
+    freshMinutes: null
+  });
+  const newOnes = base.filter(it => ageHours(it) * 60 <= NEW_MAX_AGE_MIN);
+  return { newOnes, eligible: base };
 }
 
-export function extractMileageKm(str = '') {
-  const m = String(str).replace(/\u00A0/g, ' ').match(KM_RX);
-  if (!m) return null;
-  const num = m[1].replace(/[ .]/g, '');
-  const n = Number(num);
-  if (!Number.isFinite(n)) return null;
-  // если написано "150 tys" как 150000 => ловим тоже
-  return n >= 1000 ? n : n * 1000;
+function uniqueNotSeen(items) {
+  const fresh = [];
+  for (const it of items) {
+    const h = adHash(it);
+    if (!hasSeen(h)) fresh.push(it);
+  }
+  return fresh;
 }
 
-export function yearBin(y) {
-  if (!y) return '';
-  // бины по 4–5 лет, чтобы не дробить слишком сильно
-  if (y <= 2005) return '≤2005';
-  if (y <= 2010) return '2006–2010';
-  if (y <= 2015) return '2011–2015';
-  if (y <= 2020) return '2016–2020';
-  return '≥2021';
+function groupPricesFrom(items, groupKey) {
+  // Собираем цены только у объявлений нужной группы
+  const arr = [];
+  for (const it of items) {
+    const g = groupKeyFromItem(it).key;
+    if (g !== groupKey) continue;
+    const p = extractPriceNumber(it);
+    if (Number.isFinite(p)) arr.push(p);
+  }
+  return arr;
 }
 
-export function mileageBin(km) {
-  if (!km) return '';
-  if (km <= 80000) return '≤80k';
-  if (km <= 150000) return '80–150k';
-  if (km <= 220000) return '150–220k';
-  if (km <= 300000) return '220–300k';
-  return '≥300k';
-}
-
-function normalizeBrandModelTokens(title = '') {
-  const t = title
-    .toLowerCase()
-    .replace(/[\/|_]+/g, ' ')
-    .replace(/[^\p{L}\p{N}\s\-]+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  let tokens = t.split(' ').filter(Boolean);
-
-  // нормализуем бренд-алиасы
-  if (tokens.length) {
-    const b = tokens[0];
-    tokens[0] = BRAND_ALIASES[b] || b;
+/* ───────────── CORE: /scrape ───────────── */
+async function runScrape(chatId) {
+  if (!START_URLS.length) {
+    await tgSend(chatId, '❌ START_URLS пуст. Добавь ссылку Wrocław +100 км.');
+    return;
   }
 
-  return tokens;
-}
+  await tgSend(chatId,
+    `🔎 Проверяю свежие объявления…\n` +
+    `Верх ленты: ~${WATCH_MAX_ITEMS} позиций/URL, новые: ≤${NEW_MAX_AGE_MIN} мин.\n` +
+    `Диапазон: ${PRICE_MIN}–${PRICE_MAX} zł.`
+  );
 
-export function modelFromTitle(title = '') {
-  const tokens = normalizeBrandModelTokens(title);
-  if (!tokens.length) return { brand: '', model: '' };
+  const raw = await apifyRunWatch(START_URLS, WATCH_MAX_ITEMS);
+  const { newOnes, eligible } = splitNewAndEligible(raw);
 
-  const brand = tokens[0];
-  // берём 1–2 токена модели (без мусорных «klima, super, kombi»)
-  const skip = new Set(['klima','super','full','opc','line','kupie','sprzedam','bezwypadkowy','combo','idealny','nowy','lpg','diesel','benzyna','hybryda','elektryczny']);
-  const modelTokens = [];
-  for (let i = 1; i < tokens.length && modelTokens.length < 3; i++) {
-    const tk = tokens[i];
-    if (skip.has(tk)) continue;
-    // игнорируем совсем короткие «x, -, /»
-    if (tk.length === 1) continue;
-    modelTokens.push(tk);
+  // Блок 1: 🆕 Новые (только не виденные)
+  const newFresh = uniqueNotSeen(newOnes);
+  if (newFresh.length) {
+    await tgSend(chatId, `🆕 Новые (≤${NEW_MAX_AGE_MIN} мин): ${newFresh.length} шт.`);
+    for (const it of newFresh) {
+      const url = it.url || it.link || it.detailUrl || '';
+      const price = extractPriceNumber(it);
+      markSeen(adHash(it), {
+        url,
+        title: it.title || it.name || '',
+        price,
+        publishedAt: getPublishedAt(it),
+        reason: 'scrape'
+      });
+      await tgSend(chatId, fmtItem(it));
+    }
+  } else {
+    await tgSend(chatId, `🆕 Новых нет.`);
   }
-  const model = modelTokens.join(' ').trim();
-  return { brand, model };
+
+  // Блок 2: 🔥 Выгодные (ниже рынка + ниже hard_cap)
+  const stillUnseen = uniqueNotSeen(eligible); // проверяем только то, чего ещё не слали
+  const hotOut = [];
+  for (const it of stillUnseen) {
+    // 1) пробуем по кэшу
+    let verdict = checkBelowMarket(it);
+
+    // 2) если нет рынка — делаем точечный добор (разово)
+    if (!verdict) {
+      const { key, brand, model, fuel, year, km } = groupKeyFromItem(it);
+      if (key) {
+        const extra = await runBrandUpdate(START_URLS, MARKET_MAX_ITEMS);
+        const numbers = groupPricesFrom(extra, key);
+        if (numbers.length >= 5) {
+          updateMarket(key, {
+            brand, model, fuel,
+            year_bin: '', km_bin: ''
+          }, numbers);
+          verdict = checkBelowMarket(it); // пробуем снова
+        }
+      }
+    }
+
+    if (verdict) {
+      hotOut.push({ it, verdict });
+    }
+  }
+
+  if (hotOut.length) {
+    await tgSend(chatId, `🔥 Выгодные сейчас: ${hotOut.length} шт.`);
+    for (const { it, verdict } of hotOut) {
+      const url = it.url || it.link || it.detailUrl || '';
+      const price = extractPriceNumber(it);
+      markSeen(adHash(it), {
+        url,
+        title: it.title || it.name || '',
+        price,
+        publishedAt: getPublishedAt(it),
+        reason: 'top'
+      });
+      const badge = fmtBelowMarketInfo(it, verdict);
+      await tgSend(chatId, fmtItem(it, `🔥 <b>ТОП</b>\n${badge}`));
+    }
+  } else {
+    await tgSend(chatId, '🔥 Выгодных не нашёл на этот раз.');
+  }
 }
 
-/**
- * Ключ группы для рыночной цены.
- * Основан на brand+model (+fuel)+год_бин+пробег_бин.
- */
-export function groupKeyFromItem(it = {}) {
-  const title = it.title || it.name || '';
-  const addl = [title, it.subtitle, it.description].filter(Boolean).join(' ');
-  const { brand, model } = modelFromTitle(title);
-  const fuel = detectFuel(addl || title);
-  const y  = extractYear(addl || title);
-  const km = extractMileageKm(addl || title);
+/* ───────────── CORE: /top ───────────── */
+async function runTop(chatId) {
+  if (!START_URLS.length) {
+    await tgSend(chatId, '❌ START_URLS пуст. Добавь ссылку Wrocław +100 км.');
+    return;
+  }
 
-  const keyParts = [
-    brand,
-    model,
-    fuel || '',
-    yearBin(y),
-    mileageBin(km),
-  ].filter(Boolean);
+  await tgSend(chatId, `🔥 Ищу ТОП за последние ${TOP_MAX_AGE_HOURS} часов…`);
 
-  const key = keyParts.join(' | ').trim();
-  return { key, brand, model, fuel, year: y, km };
+  // Берём побольше, чтобы охватить 48 часов
+  const raw = await runBrandUpdate(START_URLS, MARKET_MAX_ITEMS);
+  // Базовые фильтры + строго возраст ≤ 48ч
+  const eligible = filterFreshAndPrice(raw, {
+    priceMin: PRICE_MIN,
+    priceMax: PRICE_MAX,
+    freshDays: null, // возраст контролируем в часа́х
+    freshMinutes: null
+  }).filter(it => ageHours(it) <= TOP_MAX_AGE_HOURS);
+
+  const hot = [];
+  for (const it of eligible) {
+    let verdict = checkBelowMarket(it);
+    if (!verdict) {
+      // если нет рынка — добираем прямо сейчас (но тут extra уже = raw; можно реюз)
+      const { key, brand, model, fuel, year, km } = groupKeyFromItem(it);
+      if (key) {
+        const numbers = groupPricesFrom(raw, key);
+        if (numbers.length >= 5) {
+          updateMarket(key, {
+            brand, model, fuel,
+            year_bin: '', km_bin: ''
+          }, numbers);
+          verdict = checkBelowMarket(it);
+        }
+      }
+    }
+    if (verdict) hot.push({ it, verdict });
+  }
+
+  if (!hot.length) {
+    await tgSend(chatId, 'За 48 часов выгодных (ниже рынка) не нашлось.');
+    return;
+  }
+
+  // сортируем по величине скидки
+  hot.sort((a, b) => {
+    const pa = extractPriceNumber(a.it), pb = extractPriceNumber(b.it);
+    const da = pa / a.verdict.market_price;
+    const db = pb / b.verdict.market_price;
+    return da - db;
+  });
+
+  await tgSend(chatId, `🔥 ТОП за ${TOP_MAX_AGE_HOURS}ч: ${hot.length} шт.`);
+  for (const { it, verdict } of hot) {
+    // не шлём повторы
+    if (hasSeen(adHash(it))) continue;
+    const url = it.url || it.link || it.detailUrl || '';
+    const price = extractPriceNumber(it);
+    markSeen(adHash(it), {
+      url,
+      title: it.title || it.name || '',
+      price,
+      publishedAt: getPublishedAt(it),
+      reason: 'top'
+    });
+    const badge = fmtBelowMarketInfo(it, verdict);
+    await tgSend(chatId, fmtItem(it, `🔥 <b>ТОП</b>\n${badge}`));
+  }
 }
 
-/* ───────────── Вывод карточки ───────────── */
-export function fmtItem(it = {}, badge = '') {
-  const title = it.title || it.name || 'Без названия';
-  const price = it.price || it.priceText || '';
-  const loc   = getLocationText(it);
-  const url   = it.url || it.link || it.detailUrl || '';
-
-  const head = badge ? `${badge}\n` : '';
-  const line2 = [escapeHtml(price), escapeHtml(loc)].filter(Boolean).join(' • ');
-  return `${head}<b>${escapeHtml(title)}</b>\n${line2}\n${url}`;
+/* ───────────── CRON control ───────────── */
+function startCron(chatIdForLog = TELEGRAM_CHAT_ID) {
+  stopCron();
+  const ms = CRON_EVERY_MIN * 60 * 1000;
+  cronTimer = setInterval(() => runScrape(TELEGRAM_CHAT_ID), ms);
+  cronEnabled = true;
+  console.log(`CRON started: every ${CRON_EVERY_MIN} min`);
+  if (chatIdForLog) tgSend(chatIdForLog, `⏱ Автопоиск включён: каждые ${CRON_EVERY_MIN} мин.`);
 }
+function stopCron(chatIdForLog) {
+  if (cronTimer) clearInterval(cronTimer);
+  cronTimer = null;
+  if (cronEnabled) {
+    cronEnabled = false;
+    console.log('CRON stopped');
+    if (chatIdForLog) tgSend(chatIdForLog, '⏹ Автопоиск остановлен.');
+  }
+}
+
+/* ───────────── Telegram webhook ───────────── */
+app.post('/tg/webhook', async (req, res) => {
+  const { secret } = req.query;
+  if (secret !== TG_WEBHOOK_SECRET) return res.status(403).json({ ok: false, error: 'forbidden' });
+
+  try {
+    const update = req.body;
+    if (!update?.message) return res.json({ ok: true });
+
+    const msg = update.message;
+    const chatId = msg.chat.id;
+    const text = (msg.text || '').trim();
+
+    if (!allowChat(chatId)) {
+      await tgSend(chatId, '⛔️ Доступ ограничен.');
+      return res.json({ ok: true });
+    }
+
+    if (/^\/start\b/i.test(text)) {
+      await tgSend(chatId,
+        `Привет! Я ловлю свежие и выгодные авто по радиусу Wrocław +100км.\n` +
+        `Команды:\n` +
+        `• /scrape — разовый поиск и включение автопоиска (каждые ${CRON_EVERY_MIN} мин)\n` +
+        `• /top — ТОП за последние ${TOP_MAX_AGE_HOURS} часов\n` +
+        `• /stop — остановить автопоиск\n` +
+        `• /help — помощь`
+      );
+    } else if (/^\/help\b/i.test(text)) {
+      await tgSend(chatId,
+        `Настройки:\n` +
+        `• Ссылок: ${START_URLS.length}\n` +
+        `• Диапазон: ${PRICE_MIN}–${PRICE_MAX} zł\n` +
+        `• Новые: ≤ ${NEW_MAX_AGE_MIN} мин\n` +
+        `• ТОП возраст: ≤ ${TOP_MAX_AGE_HOURS} ч\n` +
+        `• Автопоиск: каждые ${CRON_EVERY_MIN} мин (${cronEnabled ? 'включен' : 'выключен'})`
+      );
+    } else if (/^\/stop\b/i.test(text)) {
+      stopCron(chatId);
+    } else if (/^\/top\b/i.test(text)) {
+      await runTop(chatId);
+    } else if (/^\/scrape\b/i.test(text)) {
+      await runScrape(chatId);
+      if (!cronEnabled) startCron(chatId);
+    } else {
+      await tgSend(chatId, 'Не понял. Используй /scrape, /top, /stop или /help.');
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('webhook error', e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+/* ───────────── Utils routes ───────────── */
+app.get('/', (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/tg/test', async (req, res) => {
+  const { secret, text, chatId } = req.query;
+  if (secret !== TG_WEBHOOK_SECRET) return res.status(403).json({ ok: false, error: 'forbidden' });
+  const id = chatId || TELEGRAM_CHAT_ID;
+  if (!id) return res.status(400).json({ ok: false, error: 'no chatId' });
+  const r = await tgSend(id, text || 'pong');
+  res.json(r);
+});
+
+/* ───────────── Start ───────────── */
+app.listen(PORT, () => {
+  console.log('Listening on', PORT);
+  if (cronEnabled) startCron();
+});
